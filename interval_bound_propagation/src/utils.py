@@ -50,18 +50,40 @@ def build_dataset(raw_data, batch_size=50, sequential=True):
 
 def linear_schedule(step, init_step, final_step, init_value, final_value):
   """Linear schedule."""
+  assert final_step >= init_step
+  if init_step == final_step:
+    return final_value
   rate = tf.cast(step - init_step, tf.float32) / float(final_step - init_step)
   linear_value = rate * (final_value - init_value) + init_value
   return tf.clip_by_value(linear_value, min(init_value, final_value),
                           max(init_value, final_value))
 
 
-def build_classification_specification(label, num_classes):
-  label_one_hot = tf.one_hot(label, depth=num_classes)
-  c = tf.expand_dims(tf.eye(num_classes), 0) - tf.expand_dims(label_one_hot, 2)
-  # Re-order to have batch, specs, outputs order.
-  c = tf.transpose(c, [0, 2, 1])
-  return specification.LinearSpecification(c)
+def smooth_schedule(step, init_step, final_step, init_value, final_value,
+                    mid_point=.25, beta=4.):
+  """Smooth schedule that slowly morphs into a linear schedule."""
+  assert final_value > init_value
+  assert final_step >= init_step
+  assert beta >= 2.
+  assert mid_point >= 0. and mid_point <= 1.
+  mid_step = int((final_step - init_step) * mid_point) + init_step
+  if mid_step <= init_step:
+    alpha = 1.
+  else:
+    t = (mid_step - init_step) ** (beta - 1.)
+    alpha = (final_value - init_value) / ((final_step - mid_step) * beta * t +
+                                          (mid_step - init_step) * t)
+  mid_value = alpha * (mid_step - init_step) ** beta + init_value
+  # Tensorflow operation.
+  is_ramp = tf.cast(step > init_step, tf.float32)
+  is_linear = tf.cast(step >= mid_step, tf.float32)
+  return (is_ramp * (
+      (1. - is_linear) * (
+          init_value +
+          alpha * tf.pow(tf.cast(step - init_step, tf.float32), beta)) +
+      is_linear * linear_schedule(
+          step, mid_step, final_step, mid_value, final_value)) +
+          (1. - is_ramp) * init_value)
 
 
 def add_image_normalization(model, mean, std):
@@ -85,10 +107,16 @@ def create_classification_losses(
   elide = True
   loss_type = 'xent'
   loss_margin = 10.
+  is_training_off_after_warmup = False
+  smooth_epsilon_schedule = False
   if options is not None:
     elide = options.get('elide_last_layer', elide)
     loss_type = options.get('verified_loss_type', loss_type)
     loss_margin = options.get('verified_loss_margin', loss_type)
+    is_training_off_after_warmup = options.get(
+        'is_training_off_after_warmup', is_training_off_after_warmup)
+    smooth_epsilon_schedule = options.get(
+        'smooth_epsilon_schedule', smooth_epsilon_schedule)
 
   # Loss weights.
   def _get_schedule(init, final):
@@ -109,12 +137,21 @@ def create_classification_losses(
       verified_loss=verified_loss)
 
   if rampup_steps < 0:
-    train_epsilon = epsilon
+    train_epsilon = tf.constant(epsilon)
+    is_training = not is_training_off_after_warmup
   else:
-    train_epsilon = linear_schedule(
-        global_step, warmup_steps, warmup_steps + rampup_steps, 0., epsilon)
+    if smooth_epsilon_schedule:
+      train_epsilon = smooth_schedule(
+          global_step, warmup_steps, warmup_steps + rampup_steps, 0., epsilon)
+    else:
+      train_epsilon = linear_schedule(
+          global_step, warmup_steps, warmup_steps + rampup_steps, 0., epsilon)
+    if is_training_off_after_warmup:
+      is_training = global_step < warmup_steps
+    else:
+      is_training = True
 
-  predictor_network(inputs, is_training=True)
+  predictor_network(inputs, is_training=is_training)
   num_classes = predictor_network.output_size
   if use_verification:
     logging.info('Verification active.')
@@ -122,7 +159,7 @@ def create_classification_losses(
         tf.maximum(inputs - train_epsilon, input_bounds[0]),
         tf.minimum(inputs + train_epsilon, input_bounds[1]))
     predictor_network.propagate_bounds(input_interval_bounds)
-    spec = build_classification_specification(label, num_classes)
+    spec = specification.ClassificationSpecification(label, num_classes)
     spec_builder = lambda *args, **kwargs: spec(*args, collapse=elide, **kwargs)  # pylint: disable=unnecessary-lambda
   else:
     logging.info('Verification disabled.')
@@ -132,7 +169,7 @@ def create_classification_losses(
     logging.info('Attack active.')
     s = spec
     if s is None:
-      s = build_classification_specification(label, num_classes)
+      s = specification.ClassificationSpecification(label, num_classes)
     pgd_attack = attacks.UntargetedPGDAttack(
         predictor_network, s, epsilon, num_steps=7, input_bounds=input_bounds,
         optimizer_builder=attacks.UnrolledAdam)
@@ -145,4 +182,7 @@ def create_classification_losses(
   losses(label)
   train_loss = sum(l * w for l, w in zip(losses.scalar_losses,
                                          weight_mixture))
-  return losses, train_loss
+  # Add a regularization loss.
+  regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+  train_loss = train_loss + tf.reduce_sum(regularizers)
+  return losses, train_loss, train_epsilon

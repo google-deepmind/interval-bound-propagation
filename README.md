@@ -8,7 +8,10 @@ This is not an official Google product
 ## Installation
 
 IBP can be installed with the following command:
-`python setup.py install`
+
+```bash
+pip install git+https://github.com/deepmind/interval-bound-propagation`
+```
 
 IBP will work with both the CPU and GPU version of tensorflow and dm-sonnet, but
 to allow for that it does not list Tensorflow as a requirement, so you need to

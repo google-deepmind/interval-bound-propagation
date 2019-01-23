@@ -31,11 +31,12 @@ class AbstractBounds(object):
 
   __metaclass__ = abc.ABCMeta
 
-  def propagate_through(self, wrapper):
+  def propagate_through(self, wrapper, *args):
     """Propagates bounds through a verifiable wrapper.
 
     Args:
       wrapper: `verifiable_wrapper.VerifiableWrapper`
+      *args: Additional arguments passed down to downstream callbacks.
 
     Returns:
       New bounds.
@@ -52,7 +53,7 @@ class AbstractBounds(object):
       strides = module.stride[1:-1]
       return self._conv2d(w, b, padding, strides)
     elif isinstance(wrapper, verifiable_wrapper.MonotonicWrapper):
-      return self._monotonic_fn(module)
+      return self._monotonic_fn(module, *args)
     elif isinstance(wrapper, verifiable_wrapper.BatchNormWrapper):
       return self._batch_norm(module.mean, module.variance, module.scale,
                               module.bias, module.epsilon)
@@ -61,10 +62,6 @@ class AbstractBounds(object):
     else:
       raise NotImplementedError('{} not supported.'.format(
           wrapper.__class__.__name__))
-
-  @abc.abstractmethod
-  def combine_with(self, bounds):
-    """Produces new bounds that keep track of multiple input bounds."""
 
   def _raise_not_implemented(self, name):
     raise NotImplementedError(
@@ -77,7 +74,7 @@ class AbstractBounds(object):
   def _conv2d(self, w, b, padding, strides):  # pylint: disable=unused-argument
     self._raise_not_implemented('snt.Conv2D')
 
-  def _monotonic_fn(self, fn):
+  def _monotonic_fn(self, fn, *args):  # pylint: disable=unused-argument
     self._raise_not_implemented(fn.__name__)
 
   def _batch_norm(self, mean, variance, scale, bias, epsilon):  # pylint: disable=unused-argument
@@ -102,26 +99,7 @@ class IntervalBounds(AbstractBounds):
   def upper(self):
     return self._upper
 
-  def combine_with(self, bounds):
-    if not isinstance(bounds, IntervalBounds):
-      raise NotImplementedError('Cannot combine IntervalBounds with '
-                                '{}'.format(bounds))
-    bounds._ensure_singleton()  # pylint: disable=protected-access
-    if not isinstance(self._lower, tuple):
-      self._ensure_singleton()
-      lower = (self._lower, bounds.lower)
-      upper = (self._upper, bounds.upper)
-    else:
-      lower = self._lower + (bounds.lower,)
-      upper = self._upper + (bounds.upper,)
-    return IntervalBounds(lower, upper)
-
-  def _ensure_singleton(self):
-    if isinstance(self._lower, tuple) or isinstance(self._upper, tuple):
-      raise ValueError('Cannot proceed with multiple inputs.')
-
   def _linear(self, w, b):
-    self._ensure_singleton()
     c = (self.lower + self.upper) / 2.
     r = (self.upper - self.lower) / 2.
     c = tf.matmul(c, w)
@@ -131,7 +109,6 @@ class IntervalBounds(AbstractBounds):
     return IntervalBounds(c - r, c + r)
 
   def _conv2d(self, w, b, padding, strides):
-    self._ensure_singleton()
     c = (self.lower + self.upper) / 2.
     r = (self.upper - self.lower) / 2.
     c = tf.nn.convolution(c, w, padding=padding, strides=strides)
@@ -140,17 +117,12 @@ class IntervalBounds(AbstractBounds):
     r = tf.nn.convolution(r, tf.abs(w), padding=padding, strides=strides)
     return IntervalBounds(c - r, c + r)
 
-  def _monotonic_fn(self, fn):
-    if isinstance(self._lower, tuple):
-      assert isinstance(self._upper, tuple)
-      return IntervalBounds(fn(*self.lower),
-                            fn(*self.upper))
-    self._ensure_singleton()
-    return IntervalBounds(fn(self.lower),
-                          fn(self.upper))
+  def _monotonic_fn(self, fn, *args):
+    args_lower = [self.lower] + [a.lower for a in args]
+    args_upper = [self.upper] + [a.upper for a in args]
+    return IntervalBounds(fn(*args_lower), fn(*args_upper))
 
   def _batch_norm(self, mean, variance, scale, bias, epsilon):
-    self._ensure_singleton()
     # Element-wise multiplier.
     multiplier = tf.rsqrt(variance + epsilon)
     if scale is not None:
@@ -170,6 +142,5 @@ class IntervalBounds(AbstractBounds):
     return IntervalBounds(c - r, c + r)
 
   def _batch_flatten(self):
-    self._ensure_singleton()
     return IntervalBounds(snt.BatchFlatten()(self.lower),
                           snt.BatchFlatten()(self.upper))

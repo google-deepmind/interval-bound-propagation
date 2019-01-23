@@ -151,7 +151,7 @@ def main(unused_args):
   predictor = ibp.VerifiableModelWrapper(predictor)
 
   # Training.
-  train_losses, train_loss = ibp.create_classification_losses(
+  train_losses, train_loss, _ = ibp.create_classification_losses(
       step,
       data.image,
       data.label,
@@ -193,7 +193,7 @@ def main(unused_args):
           tf.maximum(test_data.image - FLAGS.epsilon, input_bounds[0]),
           tf.minimum(test_data.image + FLAGS.epsilon, input_bounds[1]))
       predictor.propagate_bounds(input_interval_bounds)
-      test_specification = ibp.build_classification_specification(
+      test_specification = ibp.ClassificationSpecification(
           test_data.label, num_classes)
       test_attack = attack_builder(predictor, test_specification, FLAGS.epsilon,
                                    input_bounds=input_bounds,
@@ -230,7 +230,9 @@ def main(unused_args):
   test_writer = tf.summary.FileWriter(os.path.join(FLAGS.output_dir, 'test'))
 
   # Run everything.
-  with tf.train.MonitoredSession() as sess:
+  tf_config = tf.ConfigProto()
+  tf_config.gpu_options.allow_growth = True
+  with tf.train.SingularMonitoredSession(config=tf_config) as sess:
     for _ in xrange(FLAGS.steps):
       iteration, loss_value, _ = sess.run(
           [step, train_losses.scalar_losses.nominal_cross_entropy, train_op])

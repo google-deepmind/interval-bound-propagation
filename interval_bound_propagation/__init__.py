@@ -27,6 +27,7 @@ from interval_bound_propagation.src.attacks import TargetedPGDAttack
 from interval_bound_propagation.src.attacks import UnrolledAdam
 from interval_bound_propagation.src.attacks import UnrolledGradientDescent
 from interval_bound_propagation.src.attacks import UntargetedPGDAttack
+from interval_bound_propagation.src.bounds import AbstractBounds
 from interval_bound_propagation.src.bounds import IntervalBounds
 from interval_bound_propagation.src.layers import BatchNorm
 from interval_bound_propagation.src.layers import ImageNorm
@@ -35,14 +36,15 @@ from interval_bound_propagation.src.loss import ScalarLosses
 from interval_bound_propagation.src.loss import ScalarMetrics
 from interval_bound_propagation.src.model import DNN
 from interval_bound_propagation.src.model import VerifiableModelWrapper
+from interval_bound_propagation.src.specification import ClassificationSpecification
 from interval_bound_propagation.src.specification import LinearSpecification
 from interval_bound_propagation.src.utils import add_image_normalization
-from interval_bound_propagation.src.utils import build_classification_specification
 from interval_bound_propagation.src.utils import build_dataset
 from interval_bound_propagation.src.utils import create_classification_losses
 from interval_bound_propagation.src.utils import linear_schedule
 from interval_bound_propagation.src.verifiable_wrapper import BatchFlattenWrapper
 from interval_bound_propagation.src.verifiable_wrapper import BatchNormWrapper
+from interval_bound_propagation.src.verifiable_wrapper import ImageNormWrapper
 from interval_bound_propagation.src.verifiable_wrapper import LinearConv2dWrapper
 from interval_bound_propagation.src.verifiable_wrapper import LinearFCWrapper
 from interval_bound_propagation.src.verifiable_wrapper import MonotonicWrapper

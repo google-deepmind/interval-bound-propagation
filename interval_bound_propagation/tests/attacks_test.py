@@ -50,16 +50,20 @@ class AttacksTest(parameterized.TestCase, tf.test.TestCase):
 
   @parameterized.named_parameters(
       ('UntargetedWithGradientDescent',
-       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent),
+       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
       ('UntargetedWithAdam',
-       ibp.UntargetedPGDAttack, ibp.UnrolledAdam),
+       ibp.UntargetedPGDAttack, ibp.UnrolledAdam, 1.),
       ('TargetedWithGradientDescent',
-       ibp.TargetedPGDAttack, ibp.UnrolledGradientDescent),
+       ibp.TargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
       ('TargetedWithAdam',
-       ibp.TargetedPGDAttack, ibp.UnrolledAdam))
-  def testEndToEnd(self, attack_cls, optimizer_cls):
+       ibp.TargetedPGDAttack, ibp.UnrolledAdam, 1.),
+      ('DiverseEpsilon',
+       ibp.TargetedPGDAttack, ibp.UnrolledAdam, [1., 1.]))
+  def testEndToEnd(self, attack_cls, optimizer_cls, epsilon):
     # l-\infty norm of perturbation ball.
-    epsilon = 1.
+    if isinstance(epsilon, list):
+      # We test the ability to have different epsilons across dimensions.
+      epsilon = tf.constant([epsilon], dtype=tf.float32)
     bounds = (-.5, 2.5)
     # Create a simple network.
     m = snt.Linear(1, initializers={

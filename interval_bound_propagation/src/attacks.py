@@ -255,7 +255,7 @@ class UntargetedPGDAttack(PGDAttack):
   """Defines an untargeted PGD attack."""
 
   def _build(self, labels):
-    batch_size = tf.shape(self._specification.c)[0]
+    batch_size = tf.shape(self._predictor.inputs)[0]
     input_shape = list(self._predictor.inputs.shape.as_list()[1:])
     duplicated_inputs = tf.expand_dims(self._predictor.inputs, axis=0)
     # Shape is [num_restarts, batch_size, ...]
@@ -272,10 +272,9 @@ class UntargetedPGDAttack(PGDAttack):
       model_logits = eval_fn(x)  # [restarts * batch_size, output].
       model_logits = tf.reshape(
           model_logits, [self._num_restarts, batch_size, -1])
-      # c has shape [batch_size, num_specs, output].
-      obj = tf.einsum('rbo,bso->rsb', model_logits, self._specification.c)
+      obj = self._specification.evaluate(model_logits)
       # Output has dimension [num_restarts, batch_size].
-      return tf.reduce_max(obj, axis=1)
+      return tf.reduce_max(obj, axis=-1)
 
     def reduced_loss_fn(x):
       # Pick worse attack, output has shape [num_restarts, batch_size].
@@ -297,8 +296,9 @@ class UntargetedPGDAttack(PGDAttack):
     ij = tf.stack([i, j], axis=1)
     self._attack = tf.gather_nd(adversarial_input, ij)
     self._logits = eval_fn(self._attack)
-    correct_examples = tf.equal(labels, tf.argmax(self._logits, 1))
-    self._accuracy = tf.reduce_mean(tf.cast(correct_examples, tf.float32))
+    # Count the number of sample that violate any specification.
+    bounds = tf.reduce_max(self._specification.evaluate(self._logits), axis=1)
+    self._accuracy = tf.reduce_mean(tf.cast(bounds <= 0, tf.float32))
     return self._attack
 
   @property
@@ -321,8 +321,8 @@ class TargetedPGDAttack(PGDAttack):
   """Runs targeted attacks for each specification."""
 
   def _build(self, labels):
-    batch_size = tf.shape(self._specification.c)[0]
-    num_specs = tf.shape(self._specification.c)[1]
+    batch_size = tf.shape(self._predictor.inputs)[0]
+    num_specs = self._specification.num_specifications
     input_shape = list(self._predictor.inputs.shape.as_list()[1:])
     duplicated_inputs = tf.expand_dims(self._predictor.inputs, axis=0)
     # Shape is [num_restarts * num_specifications, batch_size, ...]
@@ -339,10 +339,8 @@ class TargetedPGDAttack(PGDAttack):
       model_logits = eval_fn(x)  # [restarts * num_specs * batch_size, output].
       model_logits = tf.reshape(
           model_logits, [self._num_restarts, num_specs, batch_size, -1])
-      # c has shape [batch_size, num_specs, output].
-      obj = tf.einsum('rsbo,bso->rsb', model_logits, self._specification.c)
-      # Output has dimension [num_restarts, num_objectives, batch_size]
-      return obj
+      # Output has shape [num_restarts, batch_size, num_specs].
+      return self._specification.evaluate(model_logits)
 
     def reduced_loss_fn(x):
       # Negate as we minimize.
@@ -356,6 +354,7 @@ class TargetedPGDAttack(PGDAttack):
         image_bounds=self._input_bounds, random_init=True, optimizer=optimizer)
     # Get best attack.
     adversarial_objective = objective_fn(adversarial_input)
+    adversarial_objective = tf.transpose(adversarial_objective, [0, 2, 1])
     adversarial_objective = tf.reshape(adversarial_objective, [-1, batch_size])
     adversarial_input = tf.reshape(adversarial_input,
                                    [-1, batch_size] + input_shape)
@@ -364,8 +363,9 @@ class TargetedPGDAttack(PGDAttack):
     ij = tf.stack([i, j], axis=1)
     self._attack = tf.gather_nd(adversarial_input, ij)
     self._logits = eval_fn(self._attack)
-    correct_examples = tf.equal(labels, tf.argmax(self._logits, 1))
-    self._accuracy = tf.reduce_mean(tf.cast(correct_examples, tf.float32))
+    # Count the number of sample that violate any specification.
+    bounds = tf.reduce_max(self._specification.evaluate(self._logits), axis=1)
+    self._accuracy = tf.reduce_mean(tf.cast(bounds <= 0, tf.float32))
     return self._attack
 
   @property

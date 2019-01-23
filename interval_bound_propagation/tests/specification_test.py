@@ -46,6 +46,23 @@ def _build_spec_input():
   return [MockModule(input_bounds, output_bounds, snt_module)]
 
 
+def _build_classification_specification(label, num_classes):
+  """Returns a LinearSpecification for adversarial classification."""
+  # Pre-construct the specifications of the different classes.
+  eye = np.eye(num_classes - 1)
+  specifications = []
+  for i in range(num_classes):
+    specifications.append(np.concatenate(
+        [eye[:, :i], -np.ones((num_classes - 1, 1)), eye[:, i:]], axis=1))
+  specifications = np.array(specifications, dtype=np.float32)
+  specifications = tf.constant(specifications)
+  # We can then use gather.
+  c = tf.gather(specifications, label)
+  # By construction all specifications are relevant.
+  d = tf.zeros(shape=(tf.shape(label)[0], num_classes - 1))
+  return ibp.LinearSpecification(c, d, prune_irrelevant=False)
+
+
 class SpecificationTest(tf.test.TestCase):
 
   def testLinearSpecification(self):
@@ -61,6 +78,54 @@ class SpecificationTest(tf.test.TestCase):
     with self.test_session() as sess:
       self.assertAlmostEqual(17., sess.run(values).item())
       self.assertAlmostEqual(17., sess.run(values_collapse).item())
+
+  def testEquivalenceLinearClassification(self):
+    num_classes = 3
+    def _build_model():
+      layer_types = (
+          ('conv2d', (2, 2), 4, 'VALID', 1),
+          ('activation', 'relu'),
+          ('linear', 10),
+          ('activation', 'relu'))
+      return ibp.DNN(num_classes, layer_types)
+
+    # Input.
+    batch_size = 100
+    width = height = 2
+    channels = 3
+    num_restarts = 10
+    z = tf.random.uniform((batch_size, height, width, channels),
+                          minval=-1., maxval=1., dtype=tf.float32)
+    y = tf.random.uniform((batch_size,), minval=0, maxval=num_classes,
+                          dtype=tf.int64)
+    predictor = _build_model()
+    predictor = ibp.VerifiableModelWrapper(predictor)
+    logits = predictor(z)
+    random_logits1 = tf.random.uniform((num_restarts, batch_size, num_classes))
+    random_logits2 = tf.random.uniform((num_restarts, num_classes - 1,
+                                        batch_size, num_classes))
+    input_bounds = ibp.IntervalBounds(z - 2., z + 4.)
+    predictor.propagate_bounds(input_bounds)
+
+    # Specifications.
+    s1 = ibp.ClassificationSpecification(y, num_classes)
+    s2 = _build_classification_specification(y, num_classes)
+    def _build_values(s):
+      return [
+          s(predictor.modules, collapse=False),
+          s(predictor.modules, collapse=True),
+          s.evaluate(logits),
+          s.evaluate(random_logits1),
+          s.evaluate(random_logits2)
+      ]
+    v1 = _build_values(s1)
+    v2 = _build_values(s2)
+
+    with self.test_session() as sess:
+      sess.run(tf.global_variables_initializer())
+      output1, output2 = sess.run([v1, v2])
+    for a, b in zip(output1, output2):
+      self.assertTrue(np.all(np.abs(a - b) < 1e-5))
 
 
 if __name__ == '__main__':

@@ -59,9 +59,17 @@ class VerifiableWrapper(object):
       return self._module.__class__.__name__
     return str(self._module)
 
-  def propagate_bounds(self, input_bounds):
-    self._input_bounds = input_bounds
-    self._output_bounds = input_bounds.propagate_through(self)
+  def propagate_bounds(self, *input_bounds):
+    """Propagates bounds and saves input and output bounds."""
+    if not input_bounds:
+      raise RuntimeError('propagate_bounds expects at least one argument.')
+    main_bounds = input_bounds[0]
+    if len(input_bounds) == 1:
+      self._input_bounds = main_bounds
+    else:
+      self._input_bounds = tuple(input_bounds)
+    self._output_bounds = main_bounds.propagate_through(
+        self, *input_bounds[1:])
     return self._output_bounds
 
 
@@ -86,6 +94,20 @@ class LinearConv2dWrapper(VerifiableWrapper):
 
 class MonotonicWrapper(VerifiableWrapper):
   """Wraps monotonically increasing functions of the inputs."""
+
+
+class ImageNormWrapper(MonotonicWrapper):
+  """Convinence wrapper for getting track of the ImageNorm layer."""
+
+  def __init__(self, module):
+    if not isinstance(module, layers.ImageNorm):
+      raise ValueError('Cannot wrap {} with a ImageNormWrapper.'.format(module))
+    super(ImageNormWrapper, self).__init__(module.apply)
+    self._inner_module = module
+
+  @property
+  def inner_module(self):
+    return self._inner_module
 
 
 class BatchNormWrapper(VerifiableWrapper):

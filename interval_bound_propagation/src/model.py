@@ -115,18 +115,21 @@ class VerifiableModelWrapper(snt.AbstractModule):
       self._modules = []
       self._produced_by = {z0.name: None}  # Connection graph.
       self._module_depends_on = collections.defaultdict(list)
+      self._output_by_module = {}  # For logging only.
       with snt.observe_connections(self._observer):
         logits = self._net_builder(z0, is_training=is_training)
       # Log analysis.
       for m in self._modules:
         logging.info('Found: %s', m)
+        logging.info('  Output shape: %s', self._output_by_module[m].shape)
         for depends in self._module_depends_on[m]:
           logging.info('  Depends on: %s', z0 if depends is None else depends)
-    else:
-      logits = self._net_builder(z0, is_training=is_training)
-    if not passthrough:
+      logging.info('Final logits produced by: %s',
+                   self._produced_by[logits.name])
       self._logits = logits
       self._num_classes = logits.shape[-1].value
+    else:
+      logits = self._net_builder(z0, is_training=is_training)
     return logits
 
   def _observer(self, subgraph):
@@ -159,15 +162,16 @@ class VerifiableModelWrapper(snt.AbstractModule):
     elif isinstance(m, snt.Conv2D):
       self._modules.append(verifiable_wrapper.LinearConv2dWrapper(m))
     elif isinstance(m, layers.ImageNorm):
-      self._modules.append(verifiable_wrapper.MonotonicWrapper(m.apply))
+      self._modules.append(verifiable_wrapper.ImageNormWrapper(m))
     else:
       assert isinstance(m, layers.BatchNorm)
       self._modules.append(verifiable_wrapper.BatchNormWrapper(m))
     self._produced_by[subgraph.outputs.name] = self._modules[-1]
     self._module_depends_on[self._modules[-1]].append(
         self._produced_by[input_node.name])
+    self._output_by_module[self._modules[-1]] = subgraph.outputs
 
-  def _backtrack(self, node, max_depth=10):
+  def _backtrack(self, node, max_depth=100):
     if node.name in self._produced_by:
       return
     if max_depth <= 0:
@@ -190,6 +194,7 @@ class VerifiableModelWrapper(snt.AbstractModule):
       self._produced_by[node.name] = self._modules[-1]
       self._module_depends_on[self._modules[-1]].append(
           self._produced_by[input_node.name])
+      self._output_by_module[self._modules[-1]] = node
     elif node.op.type == 'Add':
       input_node0 = node.op.inputs[0]
       input_node1 = node.op.inputs[1]
@@ -201,19 +206,62 @@ class VerifiableModelWrapper(snt.AbstractModule):
           self._produced_by[input_node0.name])
       self._module_depends_on[self._modules[-1]].append(
           self._produced_by[input_node1.name])
-    elif node.op.type == 'Mean':
-      # reduce_mean has two inputs. The first one should be produced by a
+      self._output_by_module[self._modules[-1]] = node
+    elif node.op.type in ('Mean', 'Max'):
+      # reduce_mean/max have two inputs. The first one should be produced by a
       # upstream node, while the two one should represent the axis.
       input_node = node.op.inputs[0]
       self._backtrack(input_node, max_depth - 1)
       axis = node.op.inputs[1]
+      keep_dims = node.op.get_attr('keep_dims')
       # Use function definition instead of lambda for clarity.
       def reduce_mean(x):
-        return tf.reduce_mean(x, axis=axis)
-      self._modules.append(verifiable_wrapper.MonotonicWrapper(reduce_mean))
+        return tf.reduce_mean(x, axis=axis, keep_dims=keep_dims)
+      def reduce_max(x):
+        return tf.reduce_max(x, axis=axis, keep_dims=keep_dims)
+      self._modules.append(verifiable_wrapper.MonotonicWrapper(
+          reduce_mean if node.op.type == 'Mean' else reduce_max))
       self._produced_by[node.name] = self._modules[-1]
       self._module_depends_on[self._modules[-1]].append(
           self._produced_by[input_node.name])
+      self._output_by_module[self._modules[-1]] = node
+    elif node.op.type == 'ConcatV2':
+      num_inputs = node.op.get_attr('N')
+      assert num_inputs == len(node.op.inputs) - 1
+      inputs = node.op.inputs[:num_inputs]
+      axis = node.op.inputs[num_inputs]
+      for i in inputs:
+        self._backtrack(i, max_depth - 1)
+      def concat(*args):
+        return tf.concat(args, axis=axis)
+      self._modules.append(verifiable_wrapper.MonotonicWrapper(concat))
+      self._produced_by[node.name] = self._modules[-1]
+      for i in inputs:
+        self._module_depends_on[self._modules[-1]].append(
+            self._produced_by[i.name])
+      self._output_by_module[self._modules[-1]] = node
+    elif node.op.type == 'ExpandDims':
+      input_node = node.op.inputs[0]
+      self._backtrack(input_node, max_depth - 1)
+      axis = node.op.inputs[1]
+      def expand_dims(x):
+        return tf.expand_dims(x, axis=axis)
+      self._modules.append(verifiable_wrapper.MonotonicWrapper(expand_dims))
+      self._produced_by[node.name] = self._modules[-1]
+      self._module_depends_on[self._modules[-1]].append(
+          self._produced_by[input_node.name])
+      self._output_by_module[self._modules[-1]] = node
+    elif node.op.type == 'Squeeze':
+      input_node = node.op.inputs[0]
+      self._backtrack(input_node, max_depth - 1)
+      squeeze_dims = node.op.get_attr('squeeze_dims')
+      def squeeze(x):
+        return tf.squeeze(x, axis=squeeze_dims)
+      self._modules.append(verifiable_wrapper.MonotonicWrapper(squeeze))
+      self._produced_by[node.name] = self._modules[-1]
+      self._module_depends_on[self._modules[-1]].append(
+          self._produced_by[input_node.name])
+      self._output_by_module[self._modules[-1]] = node
     else:
       raise NotImplementedError(
           'Unsupported operation: "{}".'.format(node.op.type))
@@ -221,24 +269,22 @@ class VerifiableModelWrapper(snt.AbstractModule):
   def propagate_bounds(self, input_bounds):
     self._ensure_is_connected()
     def _get_bounds(input_module):
-      return (input_bounds if input_module is None else
-              input_module.output_bounds)
+      return (
+          input_bounds if input_module is None else input_module.output_bounds)
     # By construction, this list is topologically sorted.
     for m in self._modules:
       # Construct combined input bounds.
-      upstream_modules = self._module_depends_on[m]
-      b = _get_bounds(upstream_modules[0])
-      for upstream_module in upstream_modules[1:]:
-        b = b.combine_with(_get_bounds(upstream_module))
-      m.propagate_bounds(b)
+      upstream_bounds = [_get_bounds(b) for b in self._module_depends_on[m]]
+      m.propagate_bounds(*upstream_bounds)
     # We assume that the last module is the final output layer.
-    return self._modules[-1].output_bounds
+    return self._produced_by[self._logits.name].output_bounds
 
 
 class DNN(snt.AbstractModule):
   """Simple feed-forward neural network."""
 
-  def __init__(self, num_classes, layer_types, name='predictor'):
+  def __init__(self, num_classes, layer_types, l2_regularization_scale=0.,
+               name='predictor'):
     """Constructor for the DNN.
 
     Args:
@@ -247,13 +293,21 @@ class DNN(snt.AbstractModule):
         * ('conv2d', (kernel_height, width), channels, padding, stride)
         * ('linear', output_size)
         * ('batch_normalization',)
-        * ('activation', activation) - only 'relu' is supported.
+        * ('activation', activation)
         Convolutional layers must precede all linear layers.
+      l2_regularization_scale: Scale of the L2 regularization on the weights
+        of each layer.
       name: Sonnet module name.
     """
     super(DNN, self).__init__(name=name)
     self._layer_types = list(layer_types)
     self._layer_types.append(('linear', num_classes))
+    if l2_regularization_scale > 0.:
+      regularizer = tf.contrib.layers.l2_regularizer(
+          scale=l2_regularization_scale)
+      self._regularizers = {'w': regularizer}
+    else:
+      self._regularizers = None
 
   def _build(self, z0, is_training=False):
     """Outputs logits."""
@@ -272,19 +326,21 @@ class DNN(snt.AbstractModule):
         m = snt.Conv2D(output_channels=channels,
                        kernel_shape=(kernel_height, kernel_width),
                        padding=padding, stride=stride, use_bias=True,
+                       regularizers=self._regularizers,
                        initializers=_create_conv2d_initializer(
                            zk.get_shape().as_list()[1:], channels,
                            (kernel_height, kernel_width)),
                        name=name)
         zk = m(zk)
       elif spec[0] == 'linear':
-        must_flatten = linear_id == 0
+        must_flatten = (linear_id == 0 and len(zk.shape) > 2)
         if must_flatten:
           zk = snt.BatchFlatten()(zk)
         name = 'linear_{}'.format(linear_id)
         linear_id += 1
         output_size = spec[1]
         m = snt.Linear(output_size,
+                       regularizers=self._regularizers,
                        initializers=_create_linear_initializer(
                            np.prod(zk.get_shape().as_list()[1:]), output_size),
                        name=name)
