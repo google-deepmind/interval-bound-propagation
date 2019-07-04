@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,8 +74,10 @@ class LossTest(tf.test.TestCase):
       self.assertAlmostEqual(0., accuracy_values.verified_accuracy)
       self.assertAlmostEqual(1., accuracy_values.attack_accuracy)
       expected_xent = 0.31326168751822947
-      self.assertAlmostEqual(expected_xent, loss_values.nominal_cross_entropy)
-      self.assertAlmostEqual(expected_xent, loss_values.attack_cross_entropy)
+      self.assertAlmostEqual(expected_xent, loss_values.nominal_cross_entropy,
+                             places=5)
+      self.assertAlmostEqual(expected_xent, loss_values.attack_cross_entropy,
+                             places=5)
       expected_hinge = 5.
       self.assertAlmostEqual(expected_hinge, loss_values.verified_loss)
 

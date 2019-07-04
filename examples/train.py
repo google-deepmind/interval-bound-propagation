@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ flags.DEFINE_integer('warmup_steps', 2000, 'Number of warm-up steps.')
 flags.DEFINE_integer('rampup_steps', 10000, 'Number of ramp-up steps.')
 flags.DEFINE_integer('batch_size', 100, 'Batch size.')
 flags.DEFINE_float('epsilon', .3, 'Target epsilon.')
+flags.DEFINE_float('epsilon_train', .33, 'Train epsilon.')
 flags.DEFINE_string('learning_rate', '1e-3,1e-4@15000,1e-5@25000',
                     'Learning rate schedule of the form: '
                     'initial_learning_rate[,learning:steps]*. E.g., "1e-3" or '
@@ -120,17 +121,7 @@ def main(unused_args):
   step = tf.train.get_or_create_global_step()
 
   # Learning rate.
-  tokens = FLAGS.learning_rate.split(',')
-  learning_rates = [float(tokens[0])]
-  learning_rate_boundaries = []
-  for t in tokens[1:]:
-    lr, boundary = t.split('@', 1)
-    learning_rates.append(float(lr))
-    learning_rate_boundaries.append(int(boundary))
-  logging.info('Learning rate schedule: %s at %s', str(learning_rates),
-               str(learning_rate_boundaries))
-  learning_rate = tf.train.piecewise_constant(step, learning_rate_boundaries,
-                                              learning_rates)
+  learning_rate = ibp.parse_learning_rate(step, FLAGS.learning_rate)
 
   # Dataset.
   input_bounds = (0., 1.)
@@ -145,9 +136,18 @@ def main(unused_args):
     data_test = (data_test[0], data_test[1].flatten())
   data = ibp.build_dataset(data_train, batch_size=FLAGS.batch_size,
                            sequential=False)
+  if FLAGS.dataset == 'cifar10':
+    data = data._replace(image=ibp.randomize(
+        data.image, (32, 32, 3), expand_shape=(40, 40, 3),
+        crop_shape=(32, 32, 3), vertical_flip=True))
 
   # Base predictor network.
-  predictor = ibp.DNN(num_classes, layers(FLAGS.model))
+  original_predictor = ibp.DNN(num_classes, layers(FLAGS.model))
+  predictor = original_predictor
+  if FLAGS.dataset == 'cifar10':
+    mean = (0.4914, 0.4822, 0.4465)
+    std = (0.2023, 0.1994, 0.2010)
+    predictor = ibp.add_image_normalization(original_predictor, mean, std)
   predictor = ibp.VerifiableModelWrapper(predictor)
 
   # Training.
@@ -156,7 +156,7 @@ def main(unused_args):
       data.image,
       data.label,
       predictor,
-      FLAGS.epsilon,
+      FLAGS.epsilon_train,
       loss_weights={
           'nominal': {'init': FLAGS.nominal_xent_init,
                       'final': FLAGS.nominal_xent_final},
@@ -168,7 +168,7 @@ def main(unused_args):
       warmup_steps=FLAGS.warmup_steps,
       rampup_steps=FLAGS.rampup_steps,
       input_bounds=input_bounds)
-  saver = tf.train.Saver(predictor.wrapped_network.get_variables())
+  saver = tf.train.Saver(original_predictor.get_variables())
   optimizer = tf.train.AdamOptimizer(learning_rate)
   update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
   with tf.control_dependencies(update_ops):
@@ -233,7 +233,7 @@ def main(unused_args):
   tf_config = tf.ConfigProto()
   tf_config.gpu_options.allow_growth = True
   with tf.train.SingularMonitoredSession(config=tf_config) as sess:
-    for _ in xrange(FLAGS.steps):
+    for _ in range(FLAGS.steps):
       iteration, loss_value, _ = sess.run(
           [step, train_losses.scalar_losses.nominal_cross_entropy, train_op])
       if iteration % FLAGS.test_every_n == 0:

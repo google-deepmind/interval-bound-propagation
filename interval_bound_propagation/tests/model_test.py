@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from absl.testing import parameterized
+
 import interval_bound_propagation as ibp
 import numpy as np
 import sonnet as snt
@@ -35,10 +37,7 @@ def _build_model():
   return ibp.DNN(num_classes, layer_types)
 
 
-class ModelTest(tf.test.TestCase):
-
-  def assertLen(self, container, expected_len):
-    self.assertEqual(expected_len, len(container))
+class ModelTest(parameterized.TestCase, tf.test.TestCase):
 
   def testDNN(self):
     predictor = _build_model()
@@ -79,20 +78,20 @@ class ModelTest(tf.test.TestCase):
     self.assertEqual(3, wrapper.output_size)
     self.assertEqual((1, 3), tuple(wrapper.logits.shape.as_list()))
     self.assertEqual(z, wrapper.inputs)
-    # Build another input and test passthrough.
+    # Build another input and test reuse.
     z2 = tf.constant([1, 2, 3, 4], dtype=tf.float32)
     z2 = tf.reshape(z, [1, 2, 2, 1])
-    logits = wrapper(z2, passthrough=True)
+    logits = wrapper(z2, reuse=True)
     self.assertEqual(z, wrapper.inputs)
     self.assertNotEqual(z2, wrapper.inputs)
     # Check that the verifiable modules are constructed.
     self.assertLen(wrapper.modules, 6)
-    self.assertTrue(isinstance(wrapper.modules[0].module, snt.Conv2D))
+    self.assertIsInstance(wrapper.modules[0].module, snt.Conv2D)
     self.assertEqual(wrapper.modules[1].module, tf.nn.relu)
-    self.assertTrue(isinstance(wrapper.modules[2].module, snt.BatchFlatten))
-    self.assertTrue(isinstance(wrapper.modules[3].module, snt.Linear))
+    self.assertIsInstance(wrapper.modules[2].module, snt.BatchFlatten)
+    self.assertIsInstance(wrapper.modules[3].module, snt.Linear)
     self.assertEqual(wrapper.modules[4].module, tf.nn.relu)
-    self.assertTrue(isinstance(wrapper.modules[5].module, snt.Linear))
+    self.assertIsInstance(wrapper.modules[5].module, snt.Linear)
     # Check propagation.
     self._propagation_test(wrapper, z2, logits)
 
@@ -114,7 +113,7 @@ class ModelTest(tf.test.TestCase):
     self._propagation_test(wrapper, z, logits)
 
   def testVerifiableModelWrapperPool(self):
-    def _build(z0, is_training=False):  # pylint: disable=unused-argument
+    def _build(z0):
       z = tf.reduce_mean(z0, axis=1, keep_dims=True)
       z = tf.reduce_max(z, axis=2, keep_dims=False)
       return snt.Linear(2)(z)
@@ -128,7 +127,7 @@ class ModelTest(tf.test.TestCase):
     self._propagation_test(wrapper, z, logits)
 
   def testVerifiableModelWrapperConcat(self):
-    def _build(z0, is_training=False):  # pylint: disable=unused-argument
+    def _build(z0):
       z = snt.Linear(10)(z0)
       z = tf.concat([z, z0], axis=1)
       return snt.Linear(2)(z)
@@ -141,7 +140,7 @@ class ModelTest(tf.test.TestCase):
     self._propagation_test(wrapper, z, logits)
 
   def testVerifiableModelWrapperExpandAndSqueeze(self):
-    def _build(z0, is_training=False):  # pylint: disable=unused-argument
+    def _build(z0):
       z = snt.Linear(10)(z0)
       z = tf.expand_dims(z, axis=-1)
       z = tf.squeeze(z, axis=-1)
@@ -153,6 +152,48 @@ class ModelTest(tf.test.TestCase):
     self.assertLen(wrapper.modules, 4)
     # Check propagation.
     self._propagation_test(wrapper, z, logits)
+
+  @parameterized.named_parameters(
+      ('Add', lambda z: z + z, 3),
+      ('Sub', lambda z: z - z, 3),
+      ('Identity', tf.identity, 3),
+      ('Mul', lambda z: z * z, 3),
+      ('Slice', lambda z: tf.slice(z, [0, 0], [-1, 5]), 3),
+      ('StridedSlice', lambda z: z[:, :5], 3),
+      ('Reshape', lambda z: tf.reshape(z, [2, 5]), 3),
+      ('Const', lambda z: z + tf.ones_like(z), 5))
+  def testVerifiableModelWrapperSimple(self, fn, expected_modules):
+    def _build(z0):
+      z = snt.Linear(10)(z0)
+      z = fn(z)
+      return snt.Linear(2)(z)
+
+    z = tf.constant([[1, 2, 3, 4]], dtype=tf.float32)
+    wrapper = ibp.VerifiableModelWrapper(_build)
+    logits = wrapper(z)
+    self.assertLen(wrapper.modules, expected_modules)
+    # Check propagation.
+    self._propagation_test(wrapper, z, logits)
+
+  def testMultipleInputs(self):
+    # Tensor to overwrite.
+    def _build(z0, z1):
+      return z0 + z1
+
+    z0 = tf.constant([[1, 2, 3, 4]], dtype=tf.float32)
+    z1 = tf.constant([[2, 2, 4, 4]], dtype=tf.float32)
+    wrapper = ibp.VerifiableModelWrapper(_build)
+    logits = wrapper(z0, z1)
+    input_bounds0 = ibp.IntervalBounds(z0 - 2, z0 + 1)
+    input_bounds1 = ibp.IntervalBounds(z1, z1 + 10)
+    output_bounds = wrapper.propagate_bounds(input_bounds0, input_bounds1)
+    with self.test_session() as sess:
+      sess.run(tf.global_variables_initializer())
+      o, l, u = sess.run([logits, output_bounds.lower, output_bounds.upper])
+      print(o, l, u)
+      self.assertAlmostEqual([[3., 4., 7., 8.]], o.tolist())
+      self.assertAlmostEqual([[1., 2., 5., 6.]], l.tolist())
+      self.assertAlmostEqual([[14., 15., 18., 19.]], u.tolist())
 
 
 if __name__ == '__main__':

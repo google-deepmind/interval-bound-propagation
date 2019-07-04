@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,40 +26,69 @@ import sonnet as snt
 import tensorflow as tf
 
 
-class MockVerifiableModelWrapper(object):
+class MockVerifiableModelWrapper(ibp.VerifiableModelWrapper):
   """Mock wrapper around the predictor network."""
 
-  def __init__(self, module, inputs, test):
+  def __init__(self, module, test):
+    super(MockVerifiableModelWrapper, self).__init__(None)
     self._module = module
-    self._inputs = inputs
     self._test = test
 
-  def __call__(self, z0, is_training=False, passthrough=False):
-    # passthrough must be True when building attacks.
+  def _build(self, z0, is_training=False, reuse=False):
+    # reuse must be True when building attacks.
     # Similarly, is_training should be False.
-    self._test.assertTrue(passthrough)
+    self._test.assertTrue(reuse)
     self._test.assertFalse(is_training)
     return self._module(z0)
 
-  @property
-  def inputs(self):
-    return self._inputs
+
+class MockWithoutReuse(object):
+  """Mock wrapper around the predictor network."""
+
+  def __init__(self, module, test):
+    self._module = module
+    self._test = test
+
+  def __call__(self, z0, is_training=False):
+    # is_training should be False.
+    self._test.assertFalse(is_training)
+    return self._module(z0)
+
+
+class MockWithoutIsTraining(object):
+  """Mock wrapper around the predictor network."""
+
+  def __init__(self, module, test):
+    self._module = module
+    self._test = test
+
+  def __call__(self, z0):
+    return self._module(z0)
 
 
 class AttacksTest(parameterized.TestCase, tf.test.TestCase):
 
   @parameterized.named_parameters(
-      ('UntargetedWithGradientDescent',
+      ('UntargetedWithGradientDescent', MockVerifiableModelWrapper,
        ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
-      ('UntargetedWithAdam',
+      ('UntargetedWithAdam', MockVerifiableModelWrapper,
        ibp.UntargetedPGDAttack, ibp.UnrolledAdam, 1.),
-      ('TargetedWithGradientDescent',
-       ibp.TargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
-      ('TargetedWithAdam',
-       ibp.TargetedPGDAttack, ibp.UnrolledAdam, 1.),
-      ('DiverseEpsilon',
-       ibp.TargetedPGDAttack, ibp.UnrolledAdam, [1., 1.]))
-  def testEndToEnd(self, attack_cls, optimizer_cls, epsilon):
+      ('MultiTargetedWithGradientDescent', MockVerifiableModelWrapper,
+       ibp.MultiTargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
+      ('MultiTargetedWithAdam', MockVerifiableModelWrapper,
+       ibp.MultiTargetedPGDAttack, ibp.UnrolledAdam, 1.),
+      ('DiverseEpsilon', MockVerifiableModelWrapper,
+       ibp.MultiTargetedPGDAttack, ibp.UnrolledAdam, [1., 1.]),
+      ('WithoutPassthrough', MockWithoutReuse,
+       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
+      ('WithoutIsTraining', MockWithoutIsTraining,
+       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
+      ('Restarted', MockVerifiableModelWrapper,
+       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1., True),
+      ('SPSA', MockVerifiableModelWrapper,
+       ibp.UntargetedPGDAttack, ibp.UnrolledSPSAAdam, 1.))
+  def testEndToEnd(self, predictor_cls, attack_cls, optimizer_cls, epsilon,
+                   restarted=False):
     # l-\infty norm of perturbation ball.
     if isinstance(epsilon, list):
       # We test the ability to have different epsilons across dimensions.
@@ -71,7 +100,7 @@ class AttacksTest(parameterized.TestCase, tf.test.TestCase):
         'b': tf.constant_initializer(1.),
     })
     z = tf.constant([[1, 2]], dtype=tf.float32)
-    predictor = MockVerifiableModelWrapper(m, z, self)
+    predictor = predictor_cls(m, self)
     # Not important for the test but needed.
     labels = tf.constant([1], dtype=tf.int64)
 
@@ -79,11 +108,15 @@ class AttacksTest(parameterized.TestCase, tf.test.TestCase):
     max_spec = ibp.LinearSpecification(tf.constant([[[1.]]]))
     max_attack = attack_cls(predictor, max_spec, epsilon, input_bounds=bounds,
                             optimizer_builder=optimizer_cls)
-    z_max = max_attack(labels)
+    if restarted:
+      max_attack = ibp.RestartedAttack(max_attack, num_restarts=10)
+    z_max = max_attack(z, labels)
     min_spec = ibp.LinearSpecification(tf.constant([[[-1.]]]))
     min_attack = attack_cls(predictor, min_spec, epsilon, input_bounds=bounds,
                             optimizer_builder=optimizer_cls)
-    z_min = min_attack(labels)
+    if restarted:
+      min_attack = ibp.RestartedAttack(min_attack, num_restarts=10)
+    z_min = min_attack(z, labels)
 
     with self.test_session() as sess:
       sess.run(tf.global_variables_initializer())

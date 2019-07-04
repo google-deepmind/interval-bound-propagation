@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@ import abc
 
 from absl import logging
 
+from interval_bound_propagation.src import bounds as bounds_lib
+from interval_bound_propagation.src import verifiable_wrapper
 import sonnet as snt
 import tensorflow as tf
 
@@ -47,7 +49,7 @@ class Specification(snt.AbstractModule):
         [num_restarts, num_specs, batch_size, num_classes]: The output should
           be [num_restarts, batch_size, num_specs]. For this case, the
           specifications must be evaluated individually for each column
-          (axis = 1). Used by TargetedPGDAttack.
+          (axis = 1). Used by MultiTargetedPGDAttack.
 
     Returns:
       The specification values evaluated at the network output.
@@ -86,7 +88,8 @@ class LinearSpecification(Specification):
   def _build(self, modules, collapse=True):
     """Outputs specification value."""
     # inputs have shape [batch_size, num_outputs].
-    if not collapse:
+    if not (collapse and
+            isinstance(modules[-1], verifiable_wrapper.LinearFCWrapper)):
       logging.info('Elision of last layer disabled.')
       bounds = modules[-1].output_bounds
       w = self._c
@@ -103,6 +106,7 @@ class LinearSpecification(Specification):
         b += self._d
 
     # Maximize z * w + b s.t. lower <= z <= upper.
+    bounds = bounds_lib.IntervalBounds.convert(bounds)
     c = (bounds.lower + bounds.upper) / 2.
     r = (bounds.upper - bounds.lower) / 2.
     c = tf.einsum('ij,ikj->ik', c, w)
@@ -153,20 +157,23 @@ class ClassificationSpecification(Specification):
     with self._enter_variable_scope():
       indices = []
       for i in range(self._num_classes):
-        indices.append(range(i) + range(i + 1, self._num_classes))
-      self._js = tf.constant(indices, dtype=tf.int32)
-      self._correct_idx, self._wrong_idx = self._build_indices(label)
+        indices.append(list(range(i)) + list(range(i + 1, self._num_classes)))
+      indices = tf.constant(indices, dtype=tf.int32)
+      self._correct_idx, self._wrong_idx = self._build_indices(label, indices)
 
   def _build(self, modules, collapse=True):
-    if not collapse:
+    if not (collapse and
+            isinstance(modules[-1], verifiable_wrapper.LinearFCWrapper)):
       logging.info('Elision of last layer disabled.')
       bounds = modules[-1].output_bounds
+      bounds = bounds_lib.IntervalBounds.convert(bounds)
       correct_class_logit = tf.gather_nd(bounds.lower, self._correct_idx)
       wrong_class_logits = tf.gather_nd(bounds.upper, self._wrong_idx)
       return wrong_class_logits - tf.expand_dims(correct_class_logit, 1)
 
     logging.info('Elision of last layer active.')
     bounds = modules[-1].input_bounds
+    bounds = bounds_lib.IntervalBounds.convert(bounds)
     batch_size = tf.shape(bounds.lower)[0]
     w = modules[-1].module.w
     b = modules[-1].module.b
@@ -211,8 +218,8 @@ class ClassificationSpecification(Specification):
       batch_size = tf.shape(logits)[0]
       wrong_idx = tf.concat([
           self._wrong_idx,
-          tf.tile(tf.reshape(tf.range(self._num_classes - 1, dtype=tf.int32),
-                             [1, self._num_classes - 1, 1]),
+          tf.tile(tf.reshape(tf.range(self.num_specifications, dtype=tf.int32),
+                             [1, self.num_specifications, 1]),
                   [batch_size, 1, 1])], axis=-1)
       wrong_class_logits = tf.gather_nd(logits, wrong_idx)
       wrong_class_logits = tf.transpose(wrong_class_logits, [2, 0, 1])
@@ -222,12 +229,72 @@ class ClassificationSpecification(Specification):
   def num_specifications(self):
     return self._num_classes - 1
 
-  def _build_indices(self, label):
+  def _build_indices(self, label, indices):
     batch_size = tf.shape(label)[0]
     i = tf.range(batch_size, dtype=tf.int32)
     correct_idx = tf.stack([i, tf.cast(label, tf.int32)], axis=1)
     wrong_idx = tf.stack([
         tf.tile(tf.reshape(i, [batch_size, 1]), [1, self._num_classes - 1]),
-        tf.gather(self._js, label),
+        tf.gather(indices, label),
     ], axis=2)
     return correct_idx, wrong_idx
+
+
+class TargetedClassificationSpecification(ClassificationSpecification):
+  """Defines a specification that compares the true class with another."""
+
+  def __init__(self, label, num_classes, target_class):
+    super(TargetedClassificationSpecification, self).__init__(
+        label, num_classes)
+    batch_size = tf.shape(label)[0]
+    if len(target_class.shape) == 1:
+      target_class = tf.reshape(target_class, [batch_size, 1])
+    self._num_specifications = target_class.shape[1].value
+    if self._num_specifications is None:
+      raise ValueError('Cannot retrieve the number of target classes')
+    self._target_class = target_class
+    i = tf.range(batch_size, dtype=tf.int32)
+    self._wrong_idx = tf.stack([
+        tf.tile(tf.reshape(i, [batch_size, 1]), [1, self.num_specifications]),
+        target_class
+    ], axis=2)
+
+  @property
+  def target_class(self):
+    """Returns the target class index."""
+    return self._target_class
+
+  @property
+  def num_specifications(self):
+    return self._num_specifications
+
+
+class RandomClassificationSpecification(TargetedClassificationSpecification):
+  """Creates a single random specification that targets a random class."""
+
+  def __init__(self, label, num_classes, num_targets=1, seed=None):
+    # Overwrite the target indices. Each session.run() call gets new target
+    # indices, the indices should remain the same across restarts.
+    batch_size = tf.shape(label)[0]
+    j = tf.random.uniform(shape=(batch_size, num_targets), minval=1,
+                          maxval=num_classes, dtype=tf.int32, seed=seed)
+    target_class = tf.mod(tf.cast(tf.expand_dims(label, -1), tf.int32) + j,
+                          num_classes)
+    super(RandomClassificationSpecification, self).__init__(
+        label, num_classes, target_class)
+
+
+class LeastLikelyClassificationSpecification(
+    TargetedClassificationSpecification):
+  """Creates a single specification that targets the least likely class."""
+
+  def __init__(self, label, num_classes, logits, num_targets=1):
+    # Do not target the true class. If the true class is the least likely to
+    # be predicted, it is fine to target any other class as the attack will
+    # be successful anyways.
+    j = tf.nn.top_k(-logits, k=num_targets, sorted=False).indices
+    l = tf.expand_dims(label, 1)
+    target_class = tf.mod(
+        j + tf.cast(tf.equal(j, tf.cast(l, tf.int32)), tf.int32), num_classes)
+    super(LeastLikelyClassificationSpecification, self).__init__(
+        label, num_classes, target_class)

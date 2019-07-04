@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import types
 
 from interval_bound_propagation.src import layers
 import sonnet as snt
+import tensorflow as tf
 
 
 class VerifiableWrapper(object):
@@ -51,6 +52,8 @@ class VerifiableWrapper(object):
     return self._module
 
   def __str__(self):
+    if isinstance(self._module, tf.Tensor):
+      return str(self._module)
     if isinstance(self._module, types.LambdaType):
       return self._module.__name__
     if isinstance(self._module, snt.AbstractModule):
@@ -73,6 +76,18 @@ class VerifiableWrapper(object):
     return self._output_bounds
 
 
+class ConstWrapper(VerifiableWrapper):
+  """Wraps a constant tensor."""
+
+  @property
+  def input_bounds(self):
+    raise ValueError('Cannot retrieve input bounds of ConstWrapper.')
+
+  def propagate_bounds(self):
+    # Make sure that the constant value can be converted to a tensor.
+    self._output_bounds = tf.convert_to_tensor(self._module)
+
+
 class LinearFCWrapper(VerifiableWrapper):
   """Wraps fully-connected layers."""
 
@@ -92,12 +107,31 @@ class LinearConv2dWrapper(VerifiableWrapper):
     super(LinearConv2dWrapper, self).__init__(module)
 
 
-class MonotonicWrapper(VerifiableWrapper):
+class IncreasingMonotonicWrapper(VerifiableWrapper):
   """Wraps monotonically increasing functions of the inputs."""
 
 
-class ImageNormWrapper(MonotonicWrapper):
-  """Convinence wrapper for getting track of the ImageNorm layer."""
+class SoftmaxWrapper(VerifiableWrapper):
+  """Wraps softmax layers."""
+
+  def __init__(self):
+    super(SoftmaxWrapper, self).__init__(None)
+
+
+class PiecewiseMonotonicWrapper(VerifiableWrapper):
+  """Wraps a piecewise (not necessarily increasing) monotonic function."""
+
+  def __init__(self, module, boundaries=()):
+    super(PiecewiseMonotonicWrapper, self).__init__(module)
+    self._boundaries = boundaries
+
+  @property
+  def boundaries(self):
+    return self._boundaries
+
+
+class ImageNormWrapper(IncreasingMonotonicWrapper):
+  """Convenience wrapper for getting track of the ImageNorm layer."""
 
   def __init__(self, module):
     if not isinstance(module, layers.ImageNorm):

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,10 +51,36 @@ class BatchNorm(snt.BatchNorm):
         input_batch, axis, use_batch_stats, stat_dtype)
     return self._mean, self._variance
 
-  def _build(self, input_batch, is_training):
-    """Connects the BatchNorm module into the graph."""
-    return super(BatchNorm, self)._build(input_batch, is_training,
-                                         test_local_stats=False)
+  def _build(self, input_batch, is_training=True, test_local_stats=False,
+             reuse=False):
+    """Connects the BatchNorm module into the graph.
+
+    Args:
+      input_batch: A Tensor of arbitrary dimension. By default, the final
+        dimension is not reduced over when computing the minibatch statistics.
+      is_training: A boolean to indicate if the module should be connected in
+        training mode, meaning the moving averages are updated. Can be a Tensor.
+      test_local_stats: A boolean to indicate if the statistics should be from
+        the local batch. When is_training is True, test_local_stats is not used.
+      reuse: If True, the statistics computed by previous call to _build
+        are used and is_training is ignored. Otherwise, behaves like a normal
+        batch normalization layer.
+
+    Returns:
+      A tensor with the same shape as `input_batch`.
+
+    Raises:
+      ValueError: If `axis` is not valid for the
+        input shape or has negative entries.
+    """
+    if reuse:
+      self._ensure_is_connected()
+      return tf.nn.batch_normalization(
+          input_batch, self._mean, self._variance, self._beta, self._gamma,
+          self._eps, name='batch_norm')
+    else:
+      return super(BatchNorm, self)._build(input_batch, is_training,
+                                           test_local_stats=test_local_stats)
 
   @property
   def scale(self):
@@ -105,6 +131,6 @@ class ImageNorm(snt.AbstractModule):
   def _build(self, inputs):
     return self.apply(inputs)
 
-  # Provide a function that allows to use the MonotonicWrapper.
+  # Provide a function that allows to use the IncreasingMonotonicWrapper.
   def apply(self, inputs):
     return (inputs - self._offset) * self._scale

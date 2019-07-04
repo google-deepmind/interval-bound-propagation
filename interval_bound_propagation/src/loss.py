@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Interval Bound Propagation Authors.
+# Copyright 2019 The Interval Bound Propagation Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import collections
 
 import sonnet as snt
 import tensorflow as tf
+import tensorflow_probability as tfp
 
 
 # Used to pick the least violated specification.
@@ -32,7 +33,8 @@ _BIG_NUMBER = 1e25
 ScalarMetrics = collections.namedtuple('ScalarMetrics', [
     'nominal_accuracy',
     'verified_accuracy',
-    'attack_accuracy'])
+    'attack_accuracy',
+    'attack_success'])
 
 
 ScalarLosses = collections.namedtuple('ScalarLosses', [
@@ -46,7 +48,9 @@ class Losses(snt.AbstractModule):
 
   def __init__(self, predictor, specification=None, pgd_attack=None,
                interval_bounds_loss_type='xent',
-               interval_bounds_hinge_margin=10.):
+               interval_bounds_hinge_margin=10.,
+               label_smoothing=0.,
+               pgd_attack_use_trades=False):
     super(Losses, self).__init__(name='losses')
     self._predictor = predictor
     self._specification = specification
@@ -78,16 +82,28 @@ class Losses(snt.AbstractModule):
     self._interval_bounds_loss_type = loss_type
     self._interval_bounds_loss_mode = loss_mode
     self._interval_bounds_hinge_margin = interval_bounds_hinge_margin
+    self._label_smoothing = label_smoothing
+    self._pgd_attack_use_trades = pgd_attack_use_trades
 
   def _build(self, labels):
     # Cross-entropy.
-    self._cross_entropy = tf.reduce_mean(
-        tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=labels, logits=self._predictor.logits))
+    nominal_logits = self._predictor.logits
+    if self._label_smoothing > 0:
+      num_classes = nominal_logits.shape[1].value
+      one_hot_labels = tf.one_hot(labels, num_classes)
+      smooth_positives = 1. - self._label_smoothing
+      smooth_negatives = self._label_smoothing / num_classes
+      one_hot_labels = one_hot_labels * smooth_positives + smooth_negatives
+      nominal_cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(
+          labels=one_hot_labels, logits=nominal_logits)
+    else:
+      nominal_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+          labels=labels, logits=nominal_logits)
+    self._cross_entropy = tf.reduce_mean(nominal_cross_entropy)
     # Accuracy.
-    correct_examples = tf.equal(labels, tf.argmax(self._predictor.logits, 1))
+    nominal_correct_examples = tf.equal(labels, tf.argmax(nominal_logits, 1))
     self._nominal_accuracy = tf.reduce_mean(
-        tf.cast(correct_examples, tf.float32))
+        tf.cast(nominal_correct_examples, tf.float32))
 
     # Interval bounds.
     if self._specification:
@@ -141,13 +157,31 @@ class Losses(snt.AbstractModule):
 
     # PGD attack.
     if self._attack:
-      self._attack(labels)
-      self._attack_accuracy = self._attack.accuracy
-      self._attack_cross_entropy = tf.reduce_mean(
-          tf.nn.sparse_softmax_cross_entropy_with_logits(
-              labels=labels, logits=self._attack.logits))
+      if not isinstance(self._predictor.inputs, tf.Tensor):
+        raise ValueError('Multiple inputs is not supported.')
+      self._attack(self._predictor.inputs, labels)
+      correct_examples = tf.equal(labels, tf.argmax(self._attack.logits, 1))
+      self._attack_accuracy = tf.reduce_mean(
+          tf.cast(correct_examples, tf.float32))
+      self._attack_success = tf.reduce_mean(
+          tf.cast(self._attack.success, tf.float32))
+      if self._pgd_attack_use_trades:
+        # The variable is misnamed in this case.
+        nominal_logits = tf.stop_gradient(nominal_logits)
+        attack_cross_entropy = tfp.distributions.kl_divergence(
+            tfp.distributions.Categorical(logits=nominal_logits),
+            tfp.distributions.Categorical(logits=self._attack.logits))
+      else:
+        if self._label_smoothing > 0:
+          attack_cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(
+              labels=one_hot_labels, logits=self._attack.logits)
+        else:
+          attack_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+              labels=labels, logits=self._attack.logits)
+      self._attack_cross_entropy = tf.reduce_mean(attack_cross_entropy)
     else:
       self._attack_accuracy = tf.constant(0.)
+      self._attack_success = tf.constant(1.)
       self._attack_cross_entropy = tf.constant(0.)
 
   @property
@@ -155,7 +189,8 @@ class Losses(snt.AbstractModule):
     self._ensure_is_connected()
     return ScalarMetrics(self._nominal_accuracy,
                          self._interval_bounds_accuracy,
-                         self._attack_accuracy)
+                         self._attack_accuracy,
+                         self._attack_success)
 
   @property
   def scalar_losses(self):

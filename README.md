@@ -34,3 +34,9 @@ Sven Gowal, Krishnamurthy Dvijotham, Robert Stanforth, Rudy Bunel, Chongli Qin,
 Jonathan Uesato, Relja Arandjelovic, Timothy Mann, and Pushmeet Kohli.
 "On the Effectiveness of Interval Bound Propagation for Training Verifiably
 Robust Models." _arXiv preprint arXiv:1810.12715 (2018)_.
+
+## Acknowledgements
+
+In addition to the people involved in the original publication, we would like
+to thank Sumanth Dathathri and Johannes Welbl for their contributions.
+
