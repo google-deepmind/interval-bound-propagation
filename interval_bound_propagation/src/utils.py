@@ -593,8 +593,6 @@ def _get_projection(p):
     return _projection
 
   elif p == 2:
-    # avoid_zero_div must go inside sqrt to avoid a divide by zero
-    # in the gradient through this operation
     def _projection(perturbation, epsilon, input_image, image_bounds):
       axes = list(range(1, len(perturbation.get_shape())))
       clipped_perturbation = tf.clip_by_norm(perturbation, epsilon, axes=axes)
