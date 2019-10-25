@@ -46,7 +46,7 @@ def _build_spec_input():
   return [MockModule(input_bounds, output_bounds, snt_module)]
 
 
-def _build_classification_specification(label, num_classes):
+def _build_classification_specification(label, num_classes, collapse):
   """Returns a LinearSpecification for adversarial classification."""
   # Pre-construct the specifications of the different classes.
   eye = np.eye(num_classes - 1)
@@ -60,7 +60,8 @@ def _build_classification_specification(label, num_classes):
   c = tf.gather(specifications, label)
   # By construction all specifications are relevant.
   d = tf.zeros(shape=(tf.shape(label)[0], num_classes - 1))
-  return ibp.LinearSpecification(c, d, prune_irrelevant=False)
+  return ibp.LinearSpecification(c, d, prune_irrelevant=False,
+                                 collapse=collapse)
 
 
 class SpecificationTest(tf.test.TestCase):
@@ -71,10 +72,11 @@ class SpecificationTest(tf.test.TestCase):
     c = tf.constant([[[1, 2]]], dtype=tf.float32)
     d = tf.constant([[3]], dtype=tf.float32)
     # The above is equivalent to z_{K,1} + 2 * z_{K,2} + 3 <= 0
-    spec = ibp.LinearSpecification(c, d)
+    spec = ibp.LinearSpecification(c, d, collapse=False)
+    spec_collapse = ibp.LinearSpecification(c, d, collapse=True)
     modules = _build_spec_input()
-    values = spec(modules, collapse=False)
-    values_collapse = spec(modules, collapse=True)
+    values = spec(modules)
+    values_collapse = spec_collapse(modules)
     with self.test_session() as sess:
       self.assertAlmostEqual(17., sess.run(values).item())
       self.assertAlmostEqual(17., sess.run(values_collapse).item())
@@ -108,18 +110,21 @@ class SpecificationTest(tf.test.TestCase):
     predictor.propagate_bounds(input_bounds)
 
     # Specifications.
-    s1 = ibp.ClassificationSpecification(y, num_classes)
-    s2 = _build_classification_specification(y, num_classes)
-    def _build_values(s):
+    s1 = ibp.ClassificationSpecification(y, num_classes, collapse=False)
+    s1_collapse = ibp.ClassificationSpecification(y, num_classes, collapse=True)
+    s2 = _build_classification_specification(y, num_classes, collapse=False)
+    s2_collapse = _build_classification_specification(y, num_classes,
+                                                      collapse=True)
+    def _build_values(s, s_collapse):
       return [
-          s(predictor.modules, collapse=False),
-          s(predictor.modules, collapse=True),
+          s(predictor.modules),
+          s_collapse(predictor.modules),
           s.evaluate(logits),
           s.evaluate(random_logits1),
           s.evaluate(random_logits2)
       ]
-    v1 = _build_values(s1)
-    v2 = _build_values(s2)
+    v1 = _build_values(s1, s1_collapse)
+    v2 = _build_values(s2, s2_collapse)
 
     with self.test_session() as sess:
       sess.run(tf.global_variables_initializer())

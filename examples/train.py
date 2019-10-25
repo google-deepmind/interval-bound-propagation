@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trains IBP on Mnist."""
+"""Trains a verifiable model on Mnist or CIFAR-10."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -39,7 +39,7 @@ flags.DEFINE_integer('test_every_n', 2000,
                      'Number of steps between testing iterations.')
 flags.DEFINE_integer('warmup_steps', 2000, 'Number of warm-up steps.')
 flags.DEFINE_integer('rampup_steps', 10000, 'Number of ramp-up steps.')
-flags.DEFINE_integer('batch_size', 100, 'Batch size.')
+flags.DEFINE_integer('batch_size', 200, 'Batch size.')
 flags.DEFINE_float('epsilon', .3, 'Target epsilon.')
 flags.DEFINE_float('epsilon_train', .33, 'Train epsilon.')
 flags.DEFINE_string('learning_rate', '1e-3,1e-4@15000,1e-5@25000',
@@ -54,6 +54,12 @@ flags.DEFINE_float('verified_xent_init', 0.,
                    'Initial weight for the verified cross-entropy.')
 flags.DEFINE_float('verified_xent_final', .5,
                    'Final weight for the verified cross-entropy.')
+flags.DEFINE_float('crown_bound_init', 0.,
+                   'Initial weight for mixing the CROWN bound with the IBP '
+                   'bound in the verified cross-entropy.')
+flags.DEFINE_float('crown_bound_final', 0.,
+                   'Final weight for mixing the CROWN bound with the IBP '
+                   'bound in the verified cross-entropy.')
 flags.DEFINE_float('attack_xent_init', 0.,
                    'Initial weight for the attack cross-entropy.')
 flags.DEFINE_float('attack_xent_final', 0.,
@@ -148,22 +154,42 @@ def main(unused_args):
     mean = (0.4914, 0.4822, 0.4465)
     std = (0.2023, 0.1994, 0.2010)
     predictor = ibp.add_image_normalization(original_predictor, mean, std)
-  predictor = ibp.VerifiableModelWrapper(predictor)
+  if FLAGS.crown_bound_init > 0 or FLAGS.crown_bound_final > 0:
+    logging.info('Using CROWN-IBP loss.')
+    model_wrapper = ibp.crown.VerifiableModelWrapper
+    loss_helper = ibp.crown.create_classification_losses
+  else:
+    model_wrapper = ibp.VerifiableModelWrapper
+    loss_helper = ibp.create_classification_losses
+  predictor = model_wrapper(predictor)
 
   # Training.
-  train_losses, train_loss, _ = ibp.create_classification_losses(
+  train_losses, train_loss, _ = loss_helper(
       step,
       data.image,
       data.label,
       predictor,
       FLAGS.epsilon_train,
       loss_weights={
-          'nominal': {'init': FLAGS.nominal_xent_init,
-                      'final': FLAGS.nominal_xent_final},
-          'attack': {'init': FLAGS.attack_xent_init,
-                     'final': FLAGS.attack_xent_final},
-          'verified': {'init': FLAGS.verified_xent_init,
-                       'final': FLAGS.verified_xent_final},
+          'nominal': {
+              'init': FLAGS.nominal_xent_init,
+              'final': FLAGS.nominal_xent_final,
+              'warmup': FLAGS.verified_xent_init + FLAGS.nominal_xent_init
+          },
+          'attack': {
+              'init': FLAGS.attack_xent_init,
+              'final': FLAGS.attack_xent_final
+          },
+          'verified': {
+              'init': FLAGS.verified_xent_init,
+              'final': FLAGS.verified_xent_final,
+              'warmup': 0.
+          },
+          'crown_bound': {
+              'init': FLAGS.crown_bound_init,
+              'final': FLAGS.crown_bound_final,
+              'warmup': 0.
+          },
       },
       warmup_steps=FLAGS.warmup_steps,
       rampup_steps=FLAGS.rampup_steps,
@@ -188,7 +214,7 @@ def main(unused_args):
       """Compute the sum of all metrics."""
       test_data = ibp.build_dataset(data_test, batch_size=batch_size,
                                     sequential=True)
-      predictor(test_data.image, is_training=False)
+      predictor(test_data.image, override=True, is_training=False)
       input_interval_bounds = ibp.IntervalBounds(
           tf.maximum(test_data.image - FLAGS.epsilon, input_bounds[0]),
           tf.minimum(test_data.image + FLAGS.epsilon, input_bounds[1]))

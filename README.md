@@ -10,7 +10,7 @@ This is not an official Google product
 IBP can be installed with the following command:
 
 ```bash
-pip install git+https://github.com/deepmind/interval-bound-propagation`
+pip install git+https://github.com/deepmind/interval-bound-propagation
 ```
 
 IBP will work with both the CPU and GPU version of tensorflow and dm-sonnet, but
@@ -38,5 +38,6 @@ Robust Models." _arXiv preprint arXiv:1810.12715 (2018)_.
 ## Acknowledgements
 
 In addition to the people involved in the original publication, we would like
-to thank Sumanth Dathathri and Johannes Welbl for their contributions.
+to thank Sumanth Dathathri, Johannes Welbl and Huan Zhang for their
+contributions.
 

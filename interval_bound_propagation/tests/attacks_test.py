@@ -26,23 +26,7 @@ import sonnet as snt
 import tensorflow as tf
 
 
-class MockVerifiableModelWrapper(ibp.VerifiableModelWrapper):
-  """Mock wrapper around the predictor network."""
-
-  def __init__(self, module, test):
-    super(MockVerifiableModelWrapper, self).__init__(None)
-    self._module = module
-    self._test = test
-
-  def _build(self, z0, is_training=False, reuse=False):
-    # reuse must be True when building attacks.
-    # Similarly, is_training should be False.
-    self._test.assertTrue(reuse)
-    self._test.assertFalse(is_training)
-    return self._module(z0)
-
-
-class MockWithoutReuse(object):
+class MockWithIsTraining(object):
   """Mock wrapper around the predictor network."""
 
   def __init__(self, module, test):
@@ -69,23 +53,21 @@ class MockWithoutIsTraining(object):
 class AttacksTest(parameterized.TestCase, tf.test.TestCase):
 
   @parameterized.named_parameters(
-      ('UntargetedWithGradientDescent', MockVerifiableModelWrapper,
+      ('UntargetedWithGradientDescent', MockWithIsTraining,
        ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
-      ('UntargetedWithAdam', MockVerifiableModelWrapper,
+      ('UntargetedWithAdam', MockWithIsTraining,
        ibp.UntargetedPGDAttack, ibp.UnrolledAdam, 1.),
-      ('MultiTargetedWithGradientDescent', MockVerifiableModelWrapper,
+      ('MultiTargetedWithGradientDescent', MockWithIsTraining,
        ibp.MultiTargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
-      ('MultiTargetedWithAdam', MockVerifiableModelWrapper,
+      ('MultiTargetedWithAdam', MockWithIsTraining,
        ibp.MultiTargetedPGDAttack, ibp.UnrolledAdam, 1.),
-      ('DiverseEpsilon', MockVerifiableModelWrapper,
+      ('DiverseEpsilon', MockWithIsTraining,
        ibp.MultiTargetedPGDAttack, ibp.UnrolledAdam, [1., 1.]),
-      ('WithoutPassthrough', MockWithoutReuse,
-       ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
       ('WithoutIsTraining', MockWithoutIsTraining,
        ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1.),
-      ('Restarted', MockVerifiableModelWrapper,
+      ('Restarted', MockWithIsTraining,
        ibp.UntargetedPGDAttack, ibp.UnrolledGradientDescent, 1., True),
-      ('SPSA', MockVerifiableModelWrapper,
+      ('SPSA', MockWithIsTraining,
        ibp.UntargetedPGDAttack, ibp.UnrolledSPSAAdam, 1.))
   def testEndToEnd(self, predictor_cls, attack_cls, optimizer_cls, epsilon,
                    restarted=False):

@@ -51,14 +51,13 @@ class LossTest(tf.test.TestCase):
     # Create output specification (that forces the first logits to be greater).
     c = tf.constant([[[1, -1]]], dtype=tf.float32)
     d = tf.constant([[0]], dtype=tf.float32)
-    spec = ibp.LinearSpecification(c, d)
     # Turn elision off for more interesting results.
-    spec_builder = lambda *args, **kwargs: spec(*args, collapse=False, **kwargs)  # pylint: disable=unnecessary-lambda
+    spec = ibp.LinearSpecification(c, d, collapse=False)
     # Create an attack.
     attack = ibp.UntargetedPGDAttack(
         predictor, spec, eps, num_steps=1, input_bounds=(-100., 100))
     # Build loss.
-    losses = ibp.Losses(predictor, spec_builder, attack,
+    losses = ibp.Losses(predictor, spec, attack,
                         interval_bounds_loss_type='hinge',
                         interval_bounds_hinge_margin=0.)
     losses(labels)

@@ -40,7 +40,7 @@ def ibp_test_suite():
 
 setup(
     name='interval_bound_propagation',
-    version='1.0',
+    version='1.1',
     description='A library to train verifiably robust neural networks.',
     url='https://github.com/deepmind/interval_bound_propagation',
     author='DeepMind',

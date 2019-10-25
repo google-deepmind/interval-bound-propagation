@@ -85,6 +85,7 @@ class ModelTest(parameterized.TestCase, tf.test.TestCase):
     self.assertEqual(z, wrapper.inputs)
     self.assertNotEqual(z2, wrapper.inputs)
     # Check that the verifiable modules are constructed.
+    self.assertLen(wrapper.input_wrappers, 1)
     self.assertLen(wrapper.modules, 6)
     self.assertIsInstance(wrapper.modules[0].module, snt.Conv2D)
     self.assertEqual(wrapper.modules[1].module, tf.nn.relu)
@@ -92,6 +93,10 @@ class ModelTest(parameterized.TestCase, tf.test.TestCase):
     self.assertIsInstance(wrapper.modules[3].module, snt.Linear)
     self.assertEqual(wrapper.modules[4].module, tf.nn.relu)
     self.assertIsInstance(wrapper.modules[5].module, snt.Linear)
+    # It's a sequential network, so all nodes (including input) have fanout 1.
+    self.assertEqual(wrapper.fanout_of(wrapper.input_wrappers[0]), 1)
+    for module in wrapper.modules:
+      self.assertEqual(wrapper.fanout_of(module), 1)
     # Check propagation.
     self._propagation_test(wrapper, z2, logits)
 
@@ -108,7 +113,12 @@ class ModelTest(parameterized.TestCase, tf.test.TestCase):
     z = tf.constant([[1, 2, 3, 4]], dtype=tf.float32)
     wrapper = ibp.VerifiableModelWrapper(_build)
     logits = wrapper(z)
+    self.assertLen(wrapper.input_wrappers, 1)
     self.assertLen(wrapper.modules, 5)
+    # Check input has fanout 2, as it is the start of the resnet block.
+    self.assertEqual(wrapper.fanout_of(wrapper.input_wrappers[0]), 2)
+    for module in wrapper.modules:
+      self.assertEqual(wrapper.fanout_of(module), 1)
     # Check propagation.
     self._propagation_test(wrapper, z, logits)
 
@@ -172,6 +182,37 @@ class ModelTest(parameterized.TestCase, tf.test.TestCase):
     wrapper = ibp.VerifiableModelWrapper(_build)
     logits = wrapper(z)
     self.assertLen(wrapper.modules, expected_modules)
+    # Check propagation.
+    self._propagation_test(wrapper, z, logits)
+
+  def testPointlessReshape(self):
+    def _build(z0):
+      z = snt.Linear(10)(z0)
+      z = snt.BatchFlatten()(z)  # This is a no-op; no graph nodes created.
+      return snt.Linear(2)(z)
+
+    z = tf.constant([[1, 2, 3, 4]], dtype=tf.float32)
+    wrapper = ibp.VerifiableModelWrapper(_build)
+    logits = wrapper(z)
+    # Expect the batch flatten to have been skipped.
+    self.assertLen(wrapper.modules, 2)
+    self.assertIsInstance(wrapper.modules[0], ibp.LinearFCWrapper)
+    self.assertIsInstance(wrapper.modules[1], ibp.LinearFCWrapper)
+    # Check propagation.
+    self._propagation_test(wrapper, z, logits)
+
+  def testLeakyRelu(self):
+    def _build(z0):
+      z = snt.Linear(10)(z0)
+      z = tf.nn.leaky_relu(z0, alpha=0.375)
+      return snt.Linear(2)(z)
+
+    z = tf.constant([[1, 2, 3, 4]], dtype=tf.float32)
+    wrapper = ibp.VerifiableModelWrapper(_build)
+    logits = wrapper(z)
+    self.assertLen(wrapper.modules, 3)
+    self.assertEqual(wrapper.modules[1].module.__name__, 'leaky_relu')
+    self.assertEqual(wrapper.modules[1].parameters['alpha'], 0.375)
     # Check propagation.
     self._propagation_test(wrapper, z, logits)
 

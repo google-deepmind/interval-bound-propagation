@@ -35,15 +35,16 @@ class LayersTest(tf.test.TestCase):
 
   def assertBetween(self, value, minv, maxv):
     """Asserts that value is between minv and maxv (inclusive)."""
-    self.assertTrue(minv <= value)
-    self.assertTrue(maxv >= value)
+    self.assertLessEqual(minv, value)
+    self.assertGreaterEqual(maxv, value)
 
   # Subset of the tests in sonnet/python/modules/batch_norm_test.py.
   def testBatchNormUpdateImproveStatistics(self):
     """Test that updating the moving_mean improves statistics."""
     _, _, inputs = _get_inputs()
     # Use small decay_rate to update faster.
-    bn = ibp.BatchNorm(offset=False, scale=False, decay_rate=0.1)
+    bn = ibp.BatchNorm(offset=False, scale=False, decay_rate=0.1,
+                       update_ops_collection=tf.GraphKeys.UPDATE_OPS)
     out1 = bn(inputs, is_training=False)
     # Build the update ops.
     bn(inputs, is_training=True)
