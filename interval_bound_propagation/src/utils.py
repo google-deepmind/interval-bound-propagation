@@ -108,6 +108,38 @@ def smooth_schedule(step, init_step, final_step, init_value, final_value,
           (1. - is_ramp) * init_value)
 
 
+def build_loss_schedule(step, warmup_steps, rampup_steps, init, final,
+                        warmup=None):
+  """Linear schedule builder.
+
+  Args:
+    step: Current step number.
+    warmup_steps: When step < warmup_steps, set value to warmup.
+    rampup_steps: Ramp up schedule value from init to final in rampup_step.
+    init: Initial schedule value after warmup_steps.
+    final: Final schedule value after warmup_steps + rampup_steps.
+    warmup: Schedule value before warmup_steps. When set to None, the warmup
+      period value is set to init.
+
+  Returns:
+    A schedule tensor.
+  """
+  if warmup is None and init == final:
+    return init
+  if rampup_steps < 0:
+    if warmup is not None:
+      return tf.cond(step < warmup_steps, lambda: tf.constant(warmup),
+                     lambda: tf.constant(final))
+    return final
+  schedule = linear_schedule(
+      step, warmup_steps, warmup_steps + rampup_steps, init, final)
+  if warmup is not None:
+    # Set the value to warmup during warmup process.
+    return tf.cond(step < warmup_steps,
+                   lambda: tf.constant(warmup), lambda: schedule)
+  return schedule
+
+
 def add_image_normalization(model, mean, std):
   def _model(x, *args, **kwargs):
     return model(layers.ImageNorm(mean, std)(x), *args, **kwargs)
@@ -115,19 +147,21 @@ def add_image_normalization(model, mean, std):
 
 
 def create_specification(label, num_classes, logits,
-                         specification_type='one_vs_all'):
+                         specification_type='one_vs_all', collapse=True):
   """Creates a specification of the desired type."""
   def _num_targets(name):
     tokens = name.rsplit('_', 1)
     return int(tokens[1]) if len(tokens) > 1 else 1
   if specification_type == 'one_vs_all':
-    return specification.ClassificationSpecification(label, num_classes)
+    return specification.ClassificationSpecification(label, num_classes,
+                                                     collapse=collapse)
   elif specification_type.startswith('random'):
     return specification.RandomClassificationSpecification(
-        label, num_classes, _num_targets(specification_type))
+        label, num_classes, _num_targets(specification_type), collapse=collapse)
   elif specification_type.startswith('least_likely'):
     return specification.LeastLikelyClassificationSpecification(
-        label, num_classes, logits, _num_targets(specification_type))
+        label, num_classes, logits, _num_targets(specification_type),
+        collapse=collapse)
   else:
     raise ValueError('Unknown specification type: "{}"'.format(
         specification_type))
@@ -135,7 +169,8 @@ def create_specification(label, num_classes, logits,
 
 def create_classification_losses(
     global_step, inputs, label, predictor_network, epsilon, loss_weights,
-    warmup_steps=0, rampup_steps=-1, input_bounds=(0., 1.), options=None):
+    warmup_steps=0, rampup_steps=-1, input_bounds=(0., 1.),
+    loss_builder=loss.Losses, options=None):
   """Create the training loss."""
   # Whether to elide the last linear layer with the specification.
   elide = True
@@ -146,7 +181,7 @@ def create_classification_losses(
   # Amount of label smoothing.
   label_smoothing = 0.
   # If True, batch normalization stops training after warm-up.
-  is_training_off_after_warmup = False
+  is_training_off_after = -1
   # If True, epsilon changes more smoothly.
   smooth_epsilon_schedule = False
   # Either 'one_vs_all', 'random_n', 'least_likely_n' or 'none'.
@@ -155,16 +190,20 @@ def create_classification_losses(
   attack_specification = 'UntargetedPGDAttack_7x1x1_UnrolledAdam_.1'
   attack_scheduled = False
   attack_random_init = 1.
-  # Whether the final loss from the attack should be standard cross-entropy
-  # or the TRADES loss (https://arxiv.org/abs/1901.08573).
-  pgd_attack_use_trades = False
+  # Model arguments.
+  nominal_args = dict(is_training=True, test_local_stats=False, reuse=False)
+  attack_args = {
+      'intermediate': dict(is_training=False, test_local_stats=False,
+                           reuse=True),
+      'final': dict(is_training=False, test_local_stats=False, reuse=True),
+  }
   if options is not None:
     elide = options.get('elide_last_layer', elide)
     loss_type = options.get('verified_loss_type', loss_type)
     loss_margin = options.get('verified_loss_margin', loss_type)
     label_smoothing = options.get('label_smoothing', label_smoothing)
-    is_training_off_after_warmup = options.get(
-        'is_training_off_after_warmup', is_training_off_after_warmup)
+    is_training_off_after = options.get(
+        'is_training_off_after', is_training_off_after)
     smooth_epsilon_schedule = options.get(
         'smooth_epsilon_schedule', smooth_epsilon_schedule)
     verified_specification = options.get(
@@ -173,24 +212,19 @@ def create_classification_losses(
         'attack_specification', attack_specification)
     attack_scheduled = options.get('attack_scheduled', attack_scheduled)
     attack_random_init = options.get('attack_random_init', attack_random_init)
-    pgd_attack_use_trades = options.get(
-        'pgd_attack_use_trades', pgd_attack_use_trades)
+    nominal_args = dict(options.get('nominal_args', nominal_args))
+    attack_args = dict(options.get('attack_args', attack_args))
 
-  # Loss weights.
-  def _get_schedule(init, final):
-    if init == final:
-      return init
-    if rampup_steps < 0:
-      return final
-    return linear_schedule(
-        global_step, warmup_steps, warmup_steps + rampup_steps, init, final)
-  def _is_active(init, final):
-    return init > 0. or final > 0.
+  def _get_schedule(init, final, warmup=None):
+    return build_loss_schedule(global_step, warmup_steps, rampup_steps, init,
+                               final, warmup)
+  def _is_loss_active(init, final, warmup=None):
+    return init > 0. or final > 0. or (warmup is not None and warmup > 0.)
   nominal_xent = _get_schedule(**loss_weights.get('nominal'))
   attack_xent = _get_schedule(**loss_weights.get('attack'))
-  use_attack = _is_active(**loss_weights.get('attack'))
+  use_attack = _is_loss_active(**loss_weights.get('attack'))
   verified_loss = _get_schedule(**loss_weights.get('verified'))
-  use_verification = _is_active(**loss_weights.get('verified'))
+  use_verification = _is_loss_active(**loss_weights.get('verified'))
   if verified_specification == 'none':
     use_verification = False
   weight_mixture = loss.ScalarLosses(
@@ -198,9 +232,9 @@ def create_classification_losses(
       attack_cross_entropy=attack_xent,
       verified_loss=verified_loss)
 
+  # Ramp-up.
   if rampup_steps < 0:
     train_epsilon = tf.constant(epsilon)
-    is_training = not is_training_off_after_warmup
   else:
     if smooth_epsilon_schedule:
       train_epsilon = smooth_schedule(
@@ -208,12 +242,22 @@ def create_classification_losses(
     else:
       train_epsilon = linear_schedule(
           global_step, warmup_steps, warmup_steps + rampup_steps, 0., epsilon)
-    if is_training_off_after_warmup:
-      is_training = global_step < warmup_steps
-    else:
-      is_training = True
 
-  logits = predictor_network(inputs, is_training=is_training)
+  # Set is_training according to options.
+  if is_training_off_after >= 0:
+    is_training = global_step < is_training_off_after
+  else:
+    is_training = True
+  # If the build arguments want training off, we set is_training to False.
+  # Otherwise, we respect the is_training_off_after option.
+  def _update_is_training(kwargs):
+    if 'is_training' in kwargs:
+      kwargs['is_training'] &= is_training
+  _update_is_training(nominal_args)
+  _update_is_training(attack_args['intermediate'])
+  _update_is_training(attack_args['final'])
+
+  logits = predictor_network(inputs, override=True, **nominal_args)
   num_classes = predictor_network.output_size
   if use_verification:
     logging.info('Verification active.')
@@ -222,25 +266,25 @@ def create_classification_losses(
         tf.minimum(inputs + train_epsilon, input_bounds[1]))
     predictor_network.propagate_bounds(input_interval_bounds)
     spec = create_specification(label, num_classes, logits,
-                                verified_specification)
-    spec_builder = lambda *args, **kwargs: spec(*args, collapse=elide, **kwargs)  # pylint: disable=unnecessary-lambda
+                                verified_specification, collapse=elide)
   else:
     logging.info('Verification disabled.')
-    spec_builder = None
+    spec = None
   if use_attack:
     logging.info('Attack active.')
     pgd_attack = create_attack(
         attack_specification, predictor_network, label,
         train_epsilon if attack_scheduled else epsilon,
-        input_bounds=input_bounds, random_init=attack_random_init)
+        input_bounds=input_bounds, random_init=attack_random_init,
+        predictor_kwargs=attack_args)
+
   else:
     logging.info('Attack disabled.')
     pgd_attack = None
-  losses = loss.Losses(predictor_network, spec_builder, pgd_attack,
-                       interval_bounds_loss_type=loss_type,
-                       interval_bounds_hinge_margin=loss_margin,
-                       label_smoothing=label_smoothing,
-                       pgd_attack_use_trades=pgd_attack_use_trades)
+  losses = loss_builder(predictor_network, spec, pgd_attack,
+                        interval_bounds_loss_type=loss_type,
+                        interval_bounds_hinge_margin=loss_margin,
+                        label_smoothing=label_smoothing)
   losses(label)
   train_loss = sum(l * w for l, w in zip(losses.scalar_losses,
                                          weight_mixture))
@@ -415,7 +459,8 @@ def get_attack_builder(logits, label, name='UntargetedPGDAttack',
 
 
 def create_attack(attack_config, predictor, label, epsilon,
-                  input_bounds=(0., 1.), random_init=1.):
+                  input_bounds=(0., 1.), random_init=1., random_seed=None,
+                  predictor_kwargs=None):
   """Creates an attack from a textual configuration.
 
   Args:
@@ -429,6 +474,8 @@ def create_attack(attack_config, predictor, label, epsilon,
     input_bounds: Tuple with minimum and maximum value allowed on inputs.
     random_init: Probability of starting from random location rather than
       nominal input image.
+    random_seed: Sets the random seed for "Random*" attacks.
+    predictor_kwargs: Dict of arguments passed to the predictor network.
 
   Returns:
     An Attack instance.
@@ -451,12 +498,12 @@ def create_attack(attack_config, predictor, label, epsilon,
     return parse_learning_rate(t, step_size)
 
   attack_cls, attack_specification, _ = get_attack_builder(
-      predictor.logits, label, name=name)
+      predictor.logits, label, name=name, random_seed=random_seed)
   attack_strategy = attack_cls(
       predictor, attack_specification, epsilon, num_steps=num_steps,
       num_restarts=inner_restarts, input_bounds=input_bounds,
       optimizer_builder=optimizer, lr_fn=attack_learning_rate_fn,
-      random_init=random_init)
+      random_init=random_init, predictor_kwargs=predictor_kwargs)
   if outer_restarts > 1:
     attack_strategy = attacks.RestartedAttack(
         attack_strategy, num_restarts=outer_restarts)

@@ -22,15 +22,16 @@ from __future__ import print_function
 import abc
 import types
 
+from absl import logging
 from interval_bound_propagation.src import layers
+import six
 import sonnet as snt
 import tensorflow as tf
 
 
+@six.add_metaclass(abc.ABCMeta)
 class VerifiableWrapper(object):
   """Abstract wrapper class."""
-
-  __metaclass__ = abc.ABCMeta
 
   def __init__(self, module):
     self._module = module
@@ -44,7 +45,6 @@ class VerifiableWrapper(object):
 
   @property
   def output_bounds(self):
-    assert self._output_bounds is not None
     return self._output_bounds
 
   @property
@@ -64,28 +64,59 @@ class VerifiableWrapper(object):
 
   def propagate_bounds(self, *input_bounds):
     """Propagates bounds and saves input and output bounds."""
-    if not input_bounds:
-      raise RuntimeError('propagate_bounds expects at least one argument.')
-    main_bounds = input_bounds[0]
+    output_bounds = self._propagate_through(self.module, *input_bounds)
+
     if len(input_bounds) == 1:
-      self._input_bounds = main_bounds
+      self._input_bounds = input_bounds[0]
     else:
       self._input_bounds = tuple(input_bounds)
-    self._output_bounds = main_bounds.propagate_through(
-        self, *input_bounds[1:])
+    self._output_bounds = output_bounds
+
+    return output_bounds
+
+  @abc.abstractmethod
+  def _propagate_through(self, module, *input_bounds):
+    """Propagates bounds through a verifiable wrapper.
+
+    Args:
+      module: This wrapped module, through which bounds are to be propagated.
+      *input_bounds: Bounds on the node's input(s).
+
+    Returns:
+      New bounds on the node's output.
+    """
+
+
+class ModelInputWrapper(object):
+  """Virtual node representing the network's inputs."""
+
+  def __init__(self, index):
+    super(ModelInputWrapper, self).__init__()
+    self._index = index
+    self._output_bounds = None
+
+  @property
+  def index(self):
+    return self._index
+
+  @property
+  def output_bounds(self):
     return self._output_bounds
+
+  @output_bounds.setter
+  def output_bounds(self, bounds):
+    self._output_bounds = bounds
+
+  def __str__(self):
+    return 'Model input {}'.format(self.index)
 
 
 class ConstWrapper(VerifiableWrapper):
   """Wraps a constant tensor."""
 
-  @property
-  def input_bounds(self):
-    raise ValueError('Cannot retrieve input bounds of ConstWrapper.')
-
-  def propagate_bounds(self):
+  def _propagate_through(self, module):
     # Make sure that the constant value can be converted to a tensor.
-    self._output_bounds = tf.convert_to_tensor(self._module)
+    return tf.convert_to_tensor(module)
 
 
 class LinearFCWrapper(VerifiableWrapper):
@@ -96,9 +127,35 @@ class LinearFCWrapper(VerifiableWrapper):
       raise ValueError('Cannot wrap {} with a LinearFCWrapper.'.format(module))
     super(LinearFCWrapper, self).__init__(module)
 
+  def _propagate_through(self, module, input_bounds):
+    w = module.w
+    b = module.b if module.has_bias else None
+    return input_bounds.apply_linear(self, w, b)
 
-class LinearConv2dWrapper(VerifiableWrapper):
+
+class LinearConvWrapper(VerifiableWrapper):
   """Wraps convolutional layers."""
+
+
+class LinearConv1dWrapper(LinearConvWrapper):
+  """Wraps 1-D convolutional layers."""
+
+  def __init__(self, module):
+    if not isinstance(module, snt.Conv1D):
+      raise ValueError('Cannot wrap {} with a LinearConv1dWrapper.'.format(
+          module))
+    super(LinearConv1dWrapper, self).__init__(module)
+
+  def _propagate_through(self, module, input_bounds):
+    w = module.w
+    b = module.b if module.has_bias else None
+    padding = module.padding
+    stride = module.stride[1]
+    return input_bounds.apply_conv1d(self, w, b, padding, stride)
+
+
+class LinearConv2dWrapper(LinearConvWrapper):
+  """Wraps 2-D convolutional layers."""
 
   def __init__(self, module):
     if not isinstance(module, snt.Conv2D):
@@ -106,9 +163,29 @@ class LinearConv2dWrapper(VerifiableWrapper):
           module))
     super(LinearConv2dWrapper, self).__init__(module)
 
+  def _propagate_through(self, module, input_bounds):
+    w = module.w
+    b = module.b if module.has_bias else None
+    padding = module.padding
+    strides = module.stride[1:-1]
+    return input_bounds.apply_conv2d(self, w, b, padding, strides)
+
 
 class IncreasingMonotonicWrapper(VerifiableWrapper):
   """Wraps monotonically increasing functions of the inputs."""
+
+  def __init__(self, module, **parameters):
+    super(IncreasingMonotonicWrapper, self).__init__(module)
+    self._parameters = parameters
+
+  @property
+  def parameters(self):
+    return self._parameters
+
+  def _propagate_through(self, module, main_bounds, *other_input_bounds):
+    return main_bounds.apply_increasing_monotonic_fn(self, module,
+                                                     *other_input_bounds,
+                                                     **self.parameters)
 
 
 class SoftmaxWrapper(VerifiableWrapper):
@@ -116,6 +193,9 @@ class SoftmaxWrapper(VerifiableWrapper):
 
   def __init__(self):
     super(SoftmaxWrapper, self).__init__(None)
+
+  def _propagate_through(self, module, input_bounds):
+    return input_bounds.apply_softmax(self)
 
 
 class PiecewiseMonotonicWrapper(VerifiableWrapper):
@@ -128,6 +208,11 @@ class PiecewiseMonotonicWrapper(VerifiableWrapper):
   @property
   def boundaries(self):
     return self._boundaries
+
+  def _propagate_through(self, module, main_bounds, *other_input_bounds):
+    return main_bounds.apply_piecewise_monotonic_fn(self, module,
+                                                    self.boundaries,
+                                                    *other_input_bounds)
 
 
 class ImageNormWrapper(IncreasingMonotonicWrapper):
@@ -148,17 +233,68 @@ class BatchNormWrapper(VerifiableWrapper):
   """Wraps batch normalization."""
 
   def __init__(self, module):
-    if not isinstance(module, layers.BatchNorm):
+    if not isinstance(module, snt.BatchNorm):
       raise ValueError('Cannot wrap {} with a BatchNormWrapper.'.format(
           module))
     super(BatchNormWrapper, self).__init__(module)
 
+  def _propagate_through(self, module, input_bounds):
+    if isinstance(module, layers.BatchNorm):
+      # This IBP-specific batch-norm implementation exposes stats recorded
+      # the most recent time the BatchNorm module was connected.
+      # These will be either the batch stats (e.g. if training) or the moving
+      # averages, depending on how the module was called.
+      mean = module.mean
+      variance = module.variance
+      epsilon = module.epsilon
+      scale = module.scale
+      bias = module.bias
 
-class BatchFlattenWrapper(VerifiableWrapper):
+    else:
+      # This plain Sonnet batch-norm implementation only exposes the
+      # moving averages.
+      logging.warn('Sonnet BatchNorm module encountered: %s. '
+                   'IBP will always use its moving averages, not the local '
+                   'batch stats, even in training mode.', str(module))
+      mean = module.moving_mean
+      variance = module.moving_variance
+      epsilon = module._eps  # pylint: disable=protected-access
+      try:
+        bias = module.beta
+      except snt.Error:
+        bias = None
+      try:
+        scale = module.gamma
+      except snt.Error:
+        scale = None
+
+    return input_bounds.apply_batch_norm(self, mean, variance,
+                                         scale, bias, epsilon)
+
+
+class BatchReshapeWrapper(VerifiableWrapper):
+  """Wraps batch reshape."""
+
+  def __init__(self, module, shape):
+    if not isinstance(module, snt.BatchReshape):
+      raise ValueError('Cannot wrap {} with a BatchReshapeWrapper.'.format(
+          module))
+    super(BatchReshapeWrapper, self).__init__(module)
+    self._shape = shape
+
+  @property
+  def shape(self):
+    return self._shape
+
+  def _propagate_through(self, module, input_bounds):
+    return input_bounds.apply_batch_reshape(self, self.shape)
+
+
+class BatchFlattenWrapper(BatchReshapeWrapper):
   """Wraps batch flatten."""
 
   def __init__(self, module):
     if not isinstance(module, snt.BatchFlatten):
       raise ValueError('Cannot wrap {} with a BatchFlattenWrapper.'.format(
           module))
-    super(BatchFlattenWrapper, self).__init__(module)
+    super(BatchFlattenWrapper, self).__init__(module, [-1])

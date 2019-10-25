@@ -25,16 +25,21 @@ from absl import logging
 
 from interval_bound_propagation.src import bounds as bounds_lib
 from interval_bound_propagation.src import verifiable_wrapper
+import six
 import sonnet as snt
 import tensorflow as tf
 
 
+@six.add_metaclass(abc.ABCMeta)
 class Specification(snt.AbstractModule):
   """Defines a specification."""
-  __metaclass__ = abc.ABCMeta
+
+  def __init__(self, name, collapse=True):
+    super(Specification, self).__init__(name=name)
+    self._collapse = collapse
 
   @abc.abstractmethod
-  def _build(self, modules, collapse=True):
+  def _build(self, modules):
     """Computes the worst-case specification value."""
 
   @abc.abstractmethod
@@ -59,13 +64,17 @@ class Specification(snt.AbstractModule):
   def num_specifications(self):
     """Returns the number of specifications."""
 
+  @property
+  def collapse(self):
+    return self._collapse
+
 
 class LinearSpecification(Specification):
   """Linear specifications: c^T * z_K + d <= 0."""
 
-  def __init__(self, c, d=None, prune_irrelevant=True):
+  def __init__(self, c, d=None, prune_irrelevant=True, collapse=True):
     """Builds a linear specification module."""
-    super(LinearSpecification, self).__init__(name='specs')
+    super(LinearSpecification, self).__init__(name='specs', collapse=collapse)
     # c has shape [batch_size, num_specifications, num_outputs]
     # d has shape [batch_size, num_specifications]
     # Some specifications may be irrelevant (not a function of the output).
@@ -85,10 +94,10 @@ class LinearSpecification(Specification):
       self._c = c
     self._d = d
 
-  def _build(self, modules, collapse=True):
+  def _build(self, modules):
     """Outputs specification value."""
     # inputs have shape [batch_size, num_outputs].
-    if not (collapse and
+    if not (self.collapse and
             isinstance(modules[-1], verifiable_wrapper.LinearFCWrapper)):
       logging.info('Elision of last layer disabled.')
       bounds = modules[-1].output_bounds
@@ -149,8 +158,9 @@ class ClassificationSpecification(Specification):
   the c and d tensors.
   """
 
-  def __init__(self, label, num_classes):
-    super(ClassificationSpecification, self).__init__(name='specs')
+  def __init__(self, label, num_classes, collapse=True):
+    super(ClassificationSpecification, self).__init__(name='specs',
+                                                      collapse=collapse)
     self._label = label
     self._num_classes = num_classes
     # Precompute indices.
@@ -161,8 +171,8 @@ class ClassificationSpecification(Specification):
       indices = tf.constant(indices, dtype=tf.int32)
       self._correct_idx, self._wrong_idx = self._build_indices(label, indices)
 
-  def _build(self, modules, collapse=True):
-    if not (collapse and
+  def _build(self, modules):
+    if not (self.collapse and
             isinstance(modules[-1], verifiable_wrapper.LinearFCWrapper)):
       logging.info('Elision of last layer disabled.')
       bounds = modules[-1].output_bounds
@@ -229,6 +239,14 @@ class ClassificationSpecification(Specification):
   def num_specifications(self):
     return self._num_classes - 1
 
+  @property
+  def correct_idx(self):
+    return self._correct_idx
+
+  @property
+  def wrong_idx(self):
+    return self._wrong_idx
+
   def _build_indices(self, label, indices):
     batch_size = tf.shape(label)[0]
     i = tf.range(batch_size, dtype=tf.int32)
@@ -243,9 +261,9 @@ class ClassificationSpecification(Specification):
 class TargetedClassificationSpecification(ClassificationSpecification):
   """Defines a specification that compares the true class with another."""
 
-  def __init__(self, label, num_classes, target_class):
+  def __init__(self, label, num_classes, target_class, collapse=True):
     super(TargetedClassificationSpecification, self).__init__(
-        label, num_classes)
+        label, num_classes, collapse=collapse)
     batch_size = tf.shape(label)[0]
     if len(target_class.shape) == 1:
       target_class = tf.reshape(target_class, [batch_size, 1])
@@ -272,7 +290,8 @@ class TargetedClassificationSpecification(ClassificationSpecification):
 class RandomClassificationSpecification(TargetedClassificationSpecification):
   """Creates a single random specification that targets a random class."""
 
-  def __init__(self, label, num_classes, num_targets=1, seed=None):
+  def __init__(self, label, num_classes, num_targets=1, seed=None,
+               collapse=True):
     # Overwrite the target indices. Each session.run() call gets new target
     # indices, the indices should remain the same across restarts.
     batch_size = tf.shape(label)[0]
@@ -281,14 +300,14 @@ class RandomClassificationSpecification(TargetedClassificationSpecification):
     target_class = tf.mod(tf.cast(tf.expand_dims(label, -1), tf.int32) + j,
                           num_classes)
     super(RandomClassificationSpecification, self).__init__(
-        label, num_classes, target_class)
+        label, num_classes, target_class, collapse=collapse)
 
 
 class LeastLikelyClassificationSpecification(
     TargetedClassificationSpecification):
   """Creates a single specification that targets the least likely class."""
 
-  def __init__(self, label, num_classes, logits, num_targets=1):
+  def __init__(self, label, num_classes, logits, num_targets=1, collapse=True):
     # Do not target the true class. If the true class is the least likely to
     # be predicted, it is fine to target any other class as the attack will
     # be successful anyways.
@@ -297,4 +316,4 @@ class LeastLikelyClassificationSpecification(
     target_class = tf.mod(
         j + tf.cast(tf.equal(j, tf.cast(l, tf.int32)), tf.int32), num_classes)
     super(LeastLikelyClassificationSpecification, self).__init__(
-        label, num_classes, target_class)
+        label, num_classes, target_class, collapse=collapse)

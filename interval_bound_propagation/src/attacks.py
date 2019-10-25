@@ -22,16 +22,16 @@ from __future__ import print_function
 import abc
 import collections
 
+import six
 import sonnet as snt
 import tensorflow as tf
 
 nest = tf.contrib.framework.nest
 
 
+@six.add_metaclass(abc.ABCMeta)
 class UnrolledOptimizer(object):
   """In graph optimizer to be used in tf.while_loop."""
-
-  __metaclass__ = abc.ABCMeta
 
   def __init__(self, colocate_gradients_with_ops=False):
     self._colocate_gradients_with_ops = colocate_gradients_with_ops
@@ -292,28 +292,34 @@ def pgd_attack(loss_fn, input_image, epsilon, num_steps,
   return tf.stop_gradient(adversarial_image)
 
 
+@six.add_metaclass(abc.ABCMeta)
 class Attack(snt.AbstractModule):
   """Defines an attack as a Sonnet module."""
-  __metaclass__ = abc.ABCMeta
 
-  def __init__(self, predictor, specification, name):
+  def __init__(self, predictor, specification, name, predictor_kwargs=None):
     super(Attack, self).__init__(name=name)
     self._predictor = predictor
     self._specification = specification
+    if predictor_kwargs is None:
+      self._kwargs = {'intermediate': {}, 'final': {}}
+    else:
+      self._kwargs = predictor_kwargs
+    self._forced_mode = None
 
-  def _eval_fn(self, x):
-    # We support any callable with a single positional argument and
-    # optional is_training and reuse.
-    try:
-      # During training, because reuse is set to True, we should reuse the
-      # normalization of the prior call to predictor (ignoring is_training).
-      # During testing, reuse has no importance.
-      return self._predictor(x, is_training=False, reuse=True)
-    except TypeError:
-      try:
-        return self._predictor(x, is_training=False)
-      except TypeError:
-        return self._predictor(x)
+  def _eval_fn(self, x, mode='intermediate'):
+    """Runs the logits corresponding to `x`.
+
+    Args:
+      x: input to the predictor network.
+      mode: Either "intermediate" or "final". Selects the desired predictor
+        arguments.
+
+    Returns:
+      Tensor of logits.
+    """
+    if self._forced_mode is not None:
+      mode = self._forced_mode
+    return self._predictor(x, **self._kwargs[mode])
 
   @abc.abstractmethod
   def _build(self, inputs, labels):
@@ -331,16 +337,22 @@ class Attack(snt.AbstractModule):
   def success(self):
     """Returns whether the attack was successful."""
 
+  def force_mode(self, mode):
+    """Only used by RestartedAttack to force the evaluation mode."""
+    self._forced_mode = mode
 
+
+@six.add_metaclass(abc.ABCMeta)
 class PGDAttack(Attack):
   """Defines a PGD attack."""
-  __metaclass__ = abc.ABCMeta
 
   def __init__(self, predictor, specification, epsilon, lr=.1, lr_fn=None,
                num_steps=20, num_restarts=1, input_bounds=(0., 1.),
                random_init=1., optimizer_builder=UnrolledGradientDescent,
-               project_perturbation=_project_perturbation):
-    super(PGDAttack, self).__init__(predictor, specification, name='pgd')
+               project_perturbation=_project_perturbation,
+               predictor_kwargs=None):
+    super(PGDAttack, self).__init__(predictor, specification, name='pgd',
+                                    predictor_kwargs=predictor_kwargs)
     self._num_steps = num_steps
     self._num_restarts = num_restarts
     self._epsilon = epsilon
@@ -413,10 +425,12 @@ class UntargetedPGDAttack(PGDAttack):
                num_steps=20, num_restarts=1, input_bounds=(0., 1.),
                random_init=1., optimizer_builder=UnrolledGradientDescent,
                project_perturbation=_project_perturbation,
-               objective_fn=_maximize_margin, success_fn=_any_greater):
+               objective_fn=_maximize_margin, success_fn=_any_greater,
+               predictor_kwargs=None):
     super(UntargetedPGDAttack, self).__init__(
         predictor, specification, epsilon, lr, lr_fn, num_steps, num_restarts,
-        input_bounds, random_init, optimizer_builder, project_perturbation)
+        input_bounds, random_init, optimizer_builder, project_perturbation,
+        predictor_kwargs)
     self._objective_fn = objective_fn
     self._success_fn = success_fn
 
@@ -464,7 +478,7 @@ class UntargetedPGDAttack(PGDAttack):
 
     self._attack = self.find_worst_attack(objective_fn, adversarial_input,
                                           batch_size, input_shape)
-    self._logits = self._eval_fn(self._attack)
+    self._logits = self._eval_fn(self._attack, mode='final')
     self._success = self._success_fn(self._specification.evaluate(self._logits))
     return self._attack
 
@@ -495,14 +509,14 @@ class UntargetedTop5PGDAttack(UntargetedPGDAttack):
                num_steps=20, num_restarts=1, input_bounds=(0., 1.),
                random_init=1., optimizer_builder=UnrolledGradientDescent,
                project_perturbation=_project_perturbation,
-               objective_fn=_maximize_topk_hinge_margin):
+               objective_fn=_maximize_topk_hinge_margin, predictor_kwargs=None):
     super(UntargetedTop5PGDAttack, self).__init__(
         predictor, specification, epsilon, lr=lr, lr_fn=lr_fn,
         num_steps=num_steps, num_restarts=num_restarts,
         input_bounds=input_bounds, random_init=random_init,
         optimizer_builder=optimizer_builder,
         project_perturbation=project_perturbation, objective_fn=objective_fn,
-        success_fn=_topk_greater)
+        success_fn=_topk_greater, predictor_kwargs=predictor_kwargs)
 
 
 class UntargetedAdaptivePGDAttack(UntargetedPGDAttack):
@@ -551,13 +565,15 @@ class MultiTargetedPGDAttack(PGDAttack):
                num_steps=20, num_restarts=1, input_bounds=(0., 1.),
                random_init=1., optimizer_builder=UnrolledGradientDescent,
                project_perturbation=_project_perturbation,
-               max_specifications=0, random_specifications=False):
+               max_specifications=0, random_specifications=False,
+               predictor_kwargs=None):
     super(MultiTargetedPGDAttack, self).__init__(
         predictor, specification, epsilon, lr=lr, lr_fn=lr_fn,
         num_steps=num_steps, num_restarts=num_restarts,
         input_bounds=input_bounds, random_init=random_init,
         optimizer_builder=optimizer_builder,
-        project_perturbation=project_perturbation)
+        project_perturbation=project_perturbation,
+        predictor_kwargs=predictor_kwargs)
     self._max_specifications = max_specifications
     self._random_specifications = random_specifications
 
@@ -618,7 +634,7 @@ class MultiTargetedPGDAttack(PGDAttack):
     j = tf.cast(tf.range(tf.shape(adversarial_objective)[1]), i.dtype)
     ij = tf.stack([i, j], axis=1)
     self._attack = tf.gather_nd(adversarial_input, ij)
-    self._logits = self._eval_fn(self._attack)
+    self._logits = self._eval_fn(self._attack, mode='final')
     # Count the number of sample that violate any specification.
     bounds = tf.reduce_max(self._specification.evaluate(self._logits), axis=1)
     self._success = (bounds > 0.)
@@ -647,13 +663,15 @@ class MemoryEfficientMultiTargetedPGDAttack(PGDAttack):
                num_steps=20, num_restarts=1, input_bounds=(0., 1.),
                random_init=1., optimizer_builder=UnrolledGradientDescent,
                project_perturbation=_project_perturbation,
-               max_specifications=0, random_specifications=False):
+               max_specifications=0, random_specifications=False,
+               predictor_kwargs=None):
     super(MemoryEfficientMultiTargetedPGDAttack, self).__init__(
         predictor, specification, epsilon, lr=lr, lr_fn=lr_fn,
         num_steps=num_steps, num_restarts=num_restarts,
         input_bounds=input_bounds, random_init=random_init,
         optimizer_builder=optimizer_builder,
-        project_perturbation=project_perturbation)
+        project_perturbation=project_perturbation,
+        predictor_kwargs=predictor_kwargs)
     self._max_specifications = max_specifications
     self._random_specifications = random_specifications
 
@@ -701,12 +719,12 @@ class MemoryEfficientMultiTargetedPGDAttack(PGDAttack):
     optimizer = self._optimizer_builder(lr=self._lr, lr_fn=self._lr_fn)
 
     # Run a separate PGD attack for each specification.
-    def cond(spec_idx, unused_attack, unused_logits, success):
+    def cond(spec_idx, unused_attack, success):
       # If we are already successful, we break.
       return tf.logical_and(spec_idx < num_specs,
                             tf.logical_not(tf.reduce_all(success)))
 
-    def body(spec_idx, attack, logits, success):
+    def body(spec_idx, attack, success):
       """Runs a separate PGD attack for each specification."""
       adversarial_input = pgd_attack(
           build_loss_fn(spec_idx), duplicated_inputs,
@@ -725,18 +743,16 @@ class MemoryEfficientMultiTargetedPGDAttack(PGDAttack):
         new_spec_idx = spec_idx + 1
       return (new_spec_idx,
               tf.where(use_new_values, new_attack, attack),
-              tf.where(use_new_values, new_logits, logits),
               tf.logical_or(success, new_success))
 
-    logits = self._eval_fn(inputs)
-    _, self._attack, self._logits, self._success = tf.while_loop(
+    _, self._attack, self._success = tf.while_loop(
         cond, body, back_prop=False, parallel_iterations=1,
         loop_vars=[
             tf.constant(0, dtype=tf.int32),
             inputs,
-            logits,
             tf.zeros([tf.shape(inputs)[0]], dtype=tf.bool),
         ])
+    self._logits = self._eval_fn(self._attack, mode='final')
     return self._attack
 
   @property
@@ -762,37 +778,37 @@ class RestartedAttack(Attack):
     super(RestartedAttack, self).__init__(
         inner_attack._predictor,  # pylint: disable=protected-access
         inner_attack._specification,  # pylint: disable=protected-access
-        name='restarted_' + inner_attack.module_name)
+        name='restarted_' + inner_attack.module_name,
+        predictor_kwargs=inner_attack._kwargs)  # pylint: disable=protected-access
     self._inner_attack = inner_attack
     self._num_restarts = num_restarts
+    # Prevent the inner attack from updating batch normalization statistics.
+    self._inner_attack.force_mode('intermediate')
 
   def _build(self, inputs, labels):
 
-    def cond(i, unused_attack, unused_logits, success):
+    def cond(i, unused_attack, success):
       # If we are already successful, we break.
       return tf.logical_and(i < self._num_restarts,
                             tf.logical_not(tf.reduce_all(success)))
 
-    def body(i, attack, logits, success):
+    def body(i, attack, success):
       new_attack = self._inner_attack(inputs, labels)
-      new_logits = self._inner_attack.logits
       new_success = self._inner_attack.success
-      # The first iteration always sets the attack and logits.
+      # The first iteration always sets the attack.
       use_new_values = tf.logical_or(tf.equal(i, 0), new_success)
       return (i + 1,
               tf.where(use_new_values, new_attack, attack),
-              tf.where(use_new_values, new_logits, logits),
               tf.logical_or(success, new_success))
 
-    logits = self._eval_fn(inputs)
-    _, self._attack, self._logits, self._success = tf.while_loop(
+    _, self._attack, self._success = tf.while_loop(
         cond, body, back_prop=False, parallel_iterations=1,
         loop_vars=[
             tf.constant(0, dtype=tf.int32),
             inputs,
-            logits,
             tf.zeros([tf.shape(inputs)[0]], dtype=tf.bool),
         ])
+    self._logits = self._eval_fn(self._attack, mode='final')
     return self._attack
 
   @property

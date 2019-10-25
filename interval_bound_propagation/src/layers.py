@@ -37,7 +37,7 @@ class BatchNorm(snt.BatchNorm):
   def __init__(self, axis=None, offset=True, scale=False,
                decay_rate=0.999, eps=1e-3, initializers=None,
                partitioners=None, regularizers=None,
-               update_ops_collection='update_ops', name='batch_norm'):
+               update_ops_collection=None, name='batch_norm'):
     """Constructs a BatchNorm module. See original code for more details."""
     super(BatchNorm, self).__init__(
         axis=axis, offset=offset, scale=scale, decay_rate=decay_rate, eps=eps,
@@ -130,6 +130,14 @@ class ImageNorm(snt.AbstractModule):
 
   def _build(self, inputs):
     return self.apply(inputs)
+
+  @property
+  def scale(self):
+    return self._scale
+
+  @property
+  def offset(self):
+    return self._offset
 
   # Provide a function that allows to use the IncreasingMonotonicWrapper.
   def apply(self, inputs):

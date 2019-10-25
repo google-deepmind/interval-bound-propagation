@@ -91,9 +91,36 @@ class VerifiableModelWrapper(snt.AbstractModule):
     return self._inputs
 
   @property
+  def input_wrappers(self):
+    self._ensure_is_connected()
+    return self._model_inputs
+
+  @property
   def modules(self):
     self._ensure_is_connected()
     return self._modules
+
+  def dependencies(self, module):
+    self._ensure_is_connected()
+    return self._module_depends_on[module]
+
+  @property
+  def output_module(self):
+    self._ensure_is_connected()
+    return self._produced_by[self._logits.name]
+
+  def fanout_of(self, node):
+    """Looks up fan-out for a given node.
+
+    Args:
+      node: `ibp.VerifiableWrapper` occurring in the network either as an
+        operation, or as the initial input.
+
+    Returns:
+      Number of times `node` occurs as the input of another operation within
+        the network, or 1 if `node` is the overall output.
+    """
+    return self._fanouts[node]
 
   def _build(self, *z0, **kwargs):
     """Outputs logits from input z0.
@@ -101,28 +128,29 @@ class VerifiableModelWrapper(snt.AbstractModule):
     Args:
       *z0: inputs as `Tensor`.
       **kwargs: Other arguments passed directly to the _build() function of the
-        wrapper model. Assumes the possible presence of `reuse` (defaults to
-        False). However, if True, this function does not update any internal
+        wrapper model. Assumes the possible presence of `override` (defaults to
+        False). However, if False, this function does not update any internal
         state and reuses any components computed by a previous call to _build().
+        If there were no previous calls to _build(), behaves as if it was set to
+        True.
 
     Returns:
       logits resulting from using z0 as inputs.
     """
-    if 'reuse' in kwargs:
-      reuse = kwargs['reuse']
-    else:
-      reuse = False
-    if reuse:
-      # Must have been connected once before.
-      self._ensure_is_connected()
-      logits = self._net_builder(*z0, **kwargs)
-    else:
+    override = not self.is_connected
+    if 'override' in kwargs:
+      override = kwargs['override'] or override
+      del kwargs['override']
+    if override:
       self._inputs = z0[0] if len(z0) == 1 else z0
       # Build underlying verifiable modules.
+      self._model_inputs = []
       self._modules = []
       self._produced_by = {}  # Connection graph.
+      self._fanouts = collections.Counter()
       for i, z in enumerate(z0):
-        self._produced_by[z.name] = i
+        self._model_inputs.append(verifiable_wrapper.ModelInputWrapper(i))
+        self._produced_by[z.name] = self._model_inputs[-1]
       self._module_depends_on = collections.defaultdict(list)
       self._output_by_module = {}
       with snt.observe_connections(self._observer):
@@ -136,66 +164,115 @@ class VerifiableModelWrapper(snt.AbstractModule):
         logging.info('  Output shape: %s => %d units', output_shape,
                      np.prod(output_shape))
         for depends in self._module_depends_on[m]:
-          logging.info('  Depends on: %s',
-                       z0[depends] if isinstance(depends, int) else depends)
+          logging.info('  Depends on: %s', depends)
       logging.info('Final logits produced by: %s',
                    self._produced_by[logits.name])
       self._logits = logits
       self._num_classes = logits.shape[-1].value
+    else:
+      # Must have been connected once before.
+      self._ensure_is_connected()
+      logits = self._net_builder(*z0, **kwargs)
     return logits
 
   def _observer(self, subgraph):
-    m = subgraph.module
-    # Only support a few operations for now.
-    if not (isinstance(m, snt.BatchFlatten) or
-            isinstance(m, snt.Linear) or
-            isinstance(m, snt.Conv2D) or
-            isinstance(m, layers.BatchNorm) or
-            isinstance(m, layers.ImageNorm)):
+    input_nodes = self._inputs_for_observed_module(subgraph)
+    if input_nodes is None:
       # We do not fail as we want to allow higher-level Sonnet components.
       # In practice, the rest of the logic will fail if we are unable to
       # connect all low-level modules.
-      logging.warn('Unprocessed module "%s"', str(m))
+      logging.warn('Unprocessed module "%s"', str(subgraph.module))
+      return
+    if subgraph.outputs in input_nodes:
+      # The Sonnet module is just returning its input as its output.
+      # This may happen with a reshape in which the shape does not change.
       return
 
-    # If the input is unknown, we must come from support sequences of
-    # TF operations.
-    if isinstance(m, layers.BatchNorm):
-      input_node = subgraph.inputs['input_batch']
-    else:
-      input_node = subgraph.inputs['inputs']
-    if input_node.name not in self._produced_by:
-      self._backtrack(input_node, max_depth=100)
+    self._add_module(self._wrapper_for_observed_module(subgraph),
+                     subgraph.outputs, *input_nodes)
 
-    if isinstance(m, snt.BatchFlatten):
-      self._modules.append(verifiable_wrapper.BatchFlattenWrapper(m))
-    elif isinstance(m, snt.Linear):
-      self._modules.append(verifiable_wrapper.LinearFCWrapper(m))
-    elif isinstance(m, snt.Conv2D):
-      self._modules.append(verifiable_wrapper.LinearConv2dWrapper(m))
-    elif isinstance(m, layers.ImageNorm):
-      self._modules.append(verifiable_wrapper.ImageNormWrapper(m))
+  def _inputs_for_observed_module(self, subgraph):
+    """Extracts input tensors from a connected Sonnet module.
+
+    This default implementation supports common layer types, but should be
+    overridden if custom layer types are to be supported.
+
+    Args:
+      subgraph: `snt.ConnectedSubGraph` specifying the Sonnet module being
+        connected, and its inputs and outputs.
+
+    Returns:
+      List of input tensors, or None if not a supported Sonnet module.
+    """
+    m = subgraph.module
+    # Only support a few operations for now.
+    if not (isinstance(m, snt.BatchReshape) or
+            isinstance(m, snt.Linear) or
+            isinstance(m, snt.Conv1D) or
+            isinstance(m, snt.Conv2D) or
+            isinstance(m, snt.BatchNorm) or
+            isinstance(m, layers.ImageNorm)):
+      return None
+
+    if isinstance(m, snt.BatchNorm):
+      return subgraph.inputs['input_batch'],
     else:
-      assert isinstance(m, layers.BatchNorm)
-      self._modules.append(verifiable_wrapper.BatchNormWrapper(m))
-    self._produced_by[subgraph.outputs.name] = self._modules[-1]
-    self._module_depends_on[self._modules[-1]].append(
-        self._produced_by[input_node.name])
-    self._output_by_module[self._modules[-1]] = subgraph.outputs
+      return subgraph.inputs['inputs'],
+
+  def _wrapper_for_observed_module(self, subgraph):
+    """Creates a wrapper for a connected Sonnet module.
+
+    This default implementation supports common layer types, but should be
+    overridden if custom layer types are to be supported.
+
+    Args:
+      subgraph: `snt.ConnectedSubGraph` specifying the Sonnet module being
+        connected, and its inputs and outputs.
+
+    Returns:
+      `ibp.VerifiableWrapper` for the Sonnet module.
+    """
+    m = subgraph.module
+    if isinstance(m, snt.BatchReshape):
+      shape = subgraph.outputs.get_shape()[1:].as_list()
+      return verifiable_wrapper.BatchReshapeWrapper(m, shape)
+    elif isinstance(m, snt.Linear):
+      return verifiable_wrapper.LinearFCWrapper(m)
+    elif isinstance(m, snt.Conv1D):
+      return verifiable_wrapper.LinearConv1dWrapper(m)
+    elif isinstance(m, snt.Conv2D):
+      return verifiable_wrapper.LinearConv2dWrapper(m)
+    elif isinstance(m, layers.ImageNorm):
+      return verifiable_wrapper.ImageNormWrapper(m)
+    else:
+      assert isinstance(m, snt.BatchNorm)
+      return verifiable_wrapper.BatchNormWrapper(m)
 
   def _backtrack(self, node, max_depth=100):
-    if node.name in self._produced_by:
-      return
-    if max_depth <= 0:
-      raise ValueError('Unable to backtrack through the graph. Consider using '
-                       'more basic Sonnet modules.')
+    if node.name not in self._produced_by:
+      if max_depth <= 0:
+        raise ValueError('Unable to backtrack through the graph. '
+                         'Consider using more basic Sonnet modules.')
+      self._wrap_node(node, max_depth=(max_depth - 1))
+    self._fanouts[self._produced_by[node.name]] += 1
 
+  def _wrap_node(self, node, **kwargs):
+    """Adds an IBP wrapper for the node, and backtracks through its inputs.
+
+    This default implementation supports common layer types, but should be
+    overridden if custom layer types are to be supported.
+
+    Implementations should create a `ibp.VerifiableWrapper` and then invoke
+    `self._add_module(wrapper, node, *input_node, **kwargs)`.
+
+    Args:
+      node: TensorFlow graph node to wrap for IBP.
+      **kwargs: Context to pass to `self._add_module`.
+    """
     # Group all unary monotonic ops at the end.
     if node.op.type in ('Add', 'AddV2', 'Mul', 'Sub', 'Maximum', 'Minimum'):
       input_node0 = node.op.inputs[0]
       input_node1 = node.op.inputs[1]
-      self._backtrack(input_node0, max_depth - 1)
-      self._backtrack(input_node1, max_depth - 1)
       if node.op.type in ('Add', 'AddV2'):
         w = verifiable_wrapper.IncreasingMonotonicWrapper(tf.add)
       elif node.op.type == 'Mul':
@@ -207,47 +284,38 @@ class VerifiableModelWrapper(snt.AbstractModule):
       elif node.op.type == 'Minimum':
         w = verifiable_wrapper.IncreasingMonotonicWrapper(tf.minimum)
 
-      self._modules.append(w)
-      self._produced_by[node.name] = self._modules[-1]
-      self._module_depends_on[self._modules[-1]].append(
-          self._produced_by[input_node0.name])
-      self._module_depends_on[self._modules[-1]].append(
-          self._produced_by[input_node1.name])
-      self._output_by_module[self._modules[-1]] = node
+      self._add_module(w, node, input_node0, input_node1, **kwargs)
       return
     elif node.op.type == 'ConcatV2':
       num_inputs = node.op.get_attr('N')
       assert num_inputs == len(node.op.inputs) - 1
       inputs = node.op.inputs[:num_inputs]
       axis = node.op.inputs[num_inputs]
-      for i in inputs:
-        self._backtrack(i, max_depth - 1)
       def concat(*args):
         return tf.concat(args, axis=axis)
-      self._modules.append(
-          verifiable_wrapper.IncreasingMonotonicWrapper(concat))
-      self._produced_by[node.name] = self._modules[-1]
-      for i in inputs:
-        self._module_depends_on[self._modules[-1]].append(
-            self._produced_by[i.name])
-      self._output_by_module[self._modules[-1]] = node
+      self._add_module(
+          verifiable_wrapper.IncreasingMonotonicWrapper(concat, axis=axis),
+          node, *inputs, **kwargs)
+      return
+    elif node.op.type == 'Softmax':
+      input_node = node.op.inputs[0]
+      self._add_module(verifiable_wrapper.SoftmaxWrapper(), node, input_node,
+                       **kwargs)
       return
     elif node.op.type == 'Const':
-      self._modules.append(verifiable_wrapper.ConstWrapper(node))
-      self._produced_by[node.name] = self._modules[-1]
-      self._output_by_module[self._modules[-1]] = node
+      self._add_module(verifiable_wrapper.ConstWrapper(node), node, **kwargs)
       return
 
     # The rest are all unary monotonic ops.
+    parameters = dict()
     if node.op.type in _MONOTONIC_NODE_OPS:
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
       # Leaky ReLUs are a special case since they have a second argument.
       if node.op.type == 'LeakyRelu':
-        alpha = node.op.get_attr('alpha')
+        parameters = dict(alpha=node.op.get_attr('alpha'))
         # Use function definition instead of lambda for clarity.
         def leaky_relu(x):
-          return tf.nn.leaky_relu(x, alpha)
+          return tf.nn.leaky_relu(x, **parameters)
         fn = leaky_relu
       else:
         fn = _MONOTONIC_NODE_OPS[node.op.type]
@@ -256,138 +324,152 @@ class VerifiableModelWrapper(snt.AbstractModule):
       # reduce_mean/max have two inputs. The first one should be produced by a
       # upstream node, while the two one should represent the axis.
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      axis = node.op.inputs[1]
-      keep_dims = node.op.get_attr('keep_dims')
+      parameters = dict(axis=node.op.inputs[1],
+                        keep_dims=node.op.get_attr('keep_dims'))
       # Use function definition instead of lambda for clarity.
       def reduce_max(x):
-        return tf.reduce_max(x, axis=axis, keep_dims=keep_dims)
+        return tf.reduce_max(x, **parameters)
       def reduce_mean(x):
-        return tf.reduce_mean(x, axis=axis, keep_dims=keep_dims)
+        return tf.reduce_mean(x, **parameters)
       def reduce_min(x):
-        return tf.reduce_min(x, axis=axis, keep_dims=keep_dims)
+        return tf.reduce_min(x, **parameters)
       def reduce_sum(x):
-        return tf.reduce_sum(x, axis=axis, keep_dims=keep_dims)
+        return tf.reduce_sum(x, **parameters)
       fn = dict(
           Max=reduce_max, Mean=reduce_mean, Sum=reduce_sum,
           Min=reduce_min)[node.op.type]
 
     elif node.op.type == 'ExpandDims':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      axis = node.op.inputs[1]
+      parameters = dict(axis=node.op.inputs[1])
       def expand_dims(x):
-        return tf.expand_dims(x, axis=axis)
+        return tf.expand_dims(x, **parameters)
       fn = expand_dims
 
     elif node.op.type == 'Transpose':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth-1)
-      perm = node.op.inputs[1]
+      parameters = dict(perm=node.op.inputs[1])
       def transpose(x):
-        return tf.transpose(x, perm=perm)
+        return tf.transpose(x, **parameters)
       fn = transpose
 
     elif node.op.type == 'Squeeze':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      squeeze_dims = node.op.get_attr('squeeze_dims')
+      parameters = dict(axis=node.op.get_attr('squeeze_dims'))
       def squeeze(x):
-        return tf.squeeze(x, axis=squeeze_dims)
+        return tf.squeeze(x, **parameters)
       fn = squeeze
 
     elif node.op.type == 'Pad':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      paddings = node.op.inputs[1]
+      parameters = dict(paddings=node.op.inputs[1])
       def pad(x):
-        return tf.pad(x, paddings=paddings)
+        return tf.pad(x, **parameters)
       fn = pad
 
-    elif node.op.type == 'MaxPool':
+    elif node.op.type in ('MaxPool', 'AvgPool'):
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      ksize = node.op.get_attr('ksize')
-      strides = node.op.get_attr('strides')
-      padding = node.op.get_attr('padding')
-      data_format = node.op.get_attr('data_format')
-      def max_pool(x):
-        return tf.nn.max_pool(x, ksize, strides, padding, data_format)
-      fn = max_pool
+      parameters = dict(
+          ksize=node.op.get_attr('ksize'),
+          strides=node.op.get_attr('strides'),
+          padding=node.op.get_attr('padding'),
+          data_format=node.op.get_attr('data_format'),
+      )
+      if node.op.type == 'MaxPool':
+        def max_pool(x):
+          return tf.nn.max_pool(x, **parameters)
+        fn = max_pool
+      elif node.op.type == 'AvgPool':
+        def avg_pool(x):
+          return tf.nn.avg_pool(x, **parameters)
+        fn = avg_pool
 
     elif node.op.type == 'Reshape':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      shape = node.op.inputs[1]
+      parameters = dict(shape=node.op.inputs[1])
       def reshape(x):
-        return tf.reshape(x, shape=shape)
+        return tf.reshape(x, **parameters)
       fn = reshape
 
     elif node.op.type == 'Identity':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
       def identity(x):
         return tf.identity(x)
       fn = identity
 
     elif node.op.type == 'MatrixDiag':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
       def matrix_diag(x):
         return tf.matrix_diag(x)
       fn = matrix_diag
 
     elif node.op.type == 'Slice':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      begin = node.op.inputs[1]
-      size = node.op.inputs[2]
+      parameters = dict(
+          begin=node.op.inputs[1],
+          size=node.op.inputs[2],
+      )
       def regular_slice(x):
-        return tf.slice(x, begin, size)
+        return tf.slice(x, **parameters)
       fn = regular_slice
 
     elif node.op.type == 'StridedSlice':
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      begin = node.op.inputs[1]
-      end = node.op.inputs[2]
-      strides = node.op.inputs[3]
-      begin_mask = node.op.get_attr('begin_mask')
-      end_mask = node.op.get_attr('end_mask')
-      ellipsis_mask = node.op.get_attr('ellipsis_mask')
-      new_axis_mask = node.op.get_attr('new_axis_mask')
-      shrink_axis_mask = node.op.get_attr('shrink_axis_mask')
+      parameters = dict(
+          begin=node.op.inputs[1],
+          end=node.op.inputs[2],
+          strides=node.op.inputs[3],
+          begin_mask=node.op.get_attr('begin_mask'),
+          end_mask=node.op.get_attr('end_mask'),
+          ellipsis_mask=node.op.get_attr('ellipsis_mask'),
+          new_axis_mask=node.op.get_attr('new_axis_mask'),
+          shrink_axis_mask=node.op.get_attr('shrink_axis_mask'),
+      )
       def strided_slice(x):
-        return tf.strided_slice(x, begin, end, strides, begin_mask, end_mask,
-                                ellipsis_mask, new_axis_mask, shrink_axis_mask)
+        return tf.strided_slice(x, **parameters)
       fn = strided_slice
 
     elif node.op.type == 'Fill':
       input_node = node.op.inputs[1]  # Shape is the first argument.
-      self._backtrack(input_node, max_depth - 1)
       dims = node.op.inputs[0]
+      parameters = dict(dims=dims)
       def fill(x):
         return tf.fill(dims, x)
       fn = fill
 
-    elif node.op.type == 'Softmax':
+    elif node.op.type == 'RealDiv':
+      # The denominator is assumed to be constant but is permitted to be
+      # example-dependent, for example a sequence's length prior to padding.
       input_node = node.op.inputs[0]
-      self._backtrack(input_node, max_depth - 1)
-      self._modules.append(verifiable_wrapper.SoftmaxWrapper())
-      self._produced_by[node.name] = self._modules[-1]
-      self._module_depends_on[self._modules[-1]].append(
-          self._produced_by[input_node.name])
-      self._output_by_module[self._modules[-1]] = node
-      return
+      denom = node.op.inputs[1]
+      parameters = dict(denom=denom)
+      def quotient(x):
+        return x / denom
+      fn = quotient
 
     else:
       raise NotImplementedError(
           'Unsupported operation: "{}" with\n{}.'.format(node.op.type, node.op))
 
-    self._modules.append(verifiable_wrapper.IncreasingMonotonicWrapper(fn))
+    self._add_module(
+        verifiable_wrapper.IncreasingMonotonicWrapper(fn, **parameters),
+        node, input_node, **kwargs)
+
+  def _add_module(self, wrapper, node, *input_nodes, **kwargs):
+    """Adds the given node wrapper, first backtracking through its inputs.
+
+    Args:
+      wrapper: `ibp.VerifiableWrapper` for the node.
+      node: TensorFlow graph node.
+      *input_nodes: Input nodes for `node`.
+      **kwargs: Contains the `max_depth` argument for recursive _backtrack call.
+    """
+    for input_node in input_nodes:
+      self._backtrack(input_node, **kwargs)
+    self._modules.append(wrapper)
     self._produced_by[node.name] = self._modules[-1]
-    self._module_depends_on[self._modules[-1]].append(
-        self._produced_by[input_node.name])
+    self._module_depends_on[self._modules[-1]].extend(
+        [self._produced_by[input_node.name] for input_node in input_nodes])
     self._output_by_module[self._modules[-1]] = node
 
   def propagate_bounds(self, *input_bounds):
@@ -405,11 +487,13 @@ class VerifiableModelWrapper(snt.AbstractModule):
       # All bounds need to be canonicalized to the same type. In particular, we
       # need to handle the case of constant bounds specially. We convert them
       # to the same type as input_bounds.
-      if isinstance(input_module, int):
-        return input_bounds[input_module]
       if isinstance(input_module, verifiable_wrapper.ConstWrapper):
         return input_bounds[0].convert(input_module.output_bounds)
       return input_module.output_bounds
+
+    # Initialise inputs' bounds.
+    for model_input in self._model_inputs:
+      model_input.output_bounds = input_bounds[model_input.index]
     # By construction, this list is topologically sorted.
     for m in self._modules:
       # Construct combined input bounds.
@@ -471,26 +555,28 @@ class StandardModelWrapper(snt.AbstractModule):
     Args:
       *z0: inputs as `Tensor`.
       **kwargs: Other arguments passed directly to the _build() function of the
-        wrapper model. Assumes the possible presence of `reuse` (defaults to
-        False). However, if True, this function does not update any internal
+        wrapper model. Assumes the possible presence of `override` (defaults to
+        False). However, if False, this function does not update any internal
         state and reuses any components computed by a previous call to _build().
+        If there were no previous calls to _build(), behaves as if it was set to
+        True.
 
     Returns:
       logits resulting from using z0 as inputs.
     """
-    if 'reuse' in kwargs:
-      reuse = kwargs['reuse']
-    else:
-      reuse = False
-    if reuse:
-      # Must have been connected once before.
-      self._ensure_is_connected()
-      logits = self._net_builder(*z0, **kwargs)
-    else:
+    override = not self.is_connected
+    if 'override' in kwargs:
+      override = kwargs['override'] or override
+      del kwargs['override']
+    if override:
       self._inputs = z0[0] if len(z0) == 1 else z0
       logits = self._net_builder(*z0, **kwargs)
       self._logits = logits
       self._num_classes = logits.shape[-1].value
+    else:
+      # Must have been connected once before.
+      self._ensure_is_connected()
+      logits = self._net_builder(*z0, **kwargs)
     return logits
 
 

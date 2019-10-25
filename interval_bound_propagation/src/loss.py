@@ -23,8 +23,6 @@ import collections
 
 import sonnet as snt
 import tensorflow as tf
-import tensorflow_probability as tfp
-
 
 # Used to pick the least violated specification.
 _BIG_NUMBER = 1e25
@@ -49,8 +47,7 @@ class Losses(snt.AbstractModule):
   def __init__(self, predictor, specification=None, pgd_attack=None,
                interval_bounds_loss_type='xent',
                interval_bounds_hinge_margin=10.,
-               label_smoothing=0.,
-               pgd_attack_use_trades=False):
+               label_smoothing=0.):
     super(Losses, self).__init__(name='losses')
     self._predictor = predictor
     self._specification = specification
@@ -83,9 +80,14 @@ class Losses(snt.AbstractModule):
     self._interval_bounds_loss_mode = loss_mode
     self._interval_bounds_hinge_margin = interval_bounds_hinge_margin
     self._label_smoothing = label_smoothing
-    self._pgd_attack_use_trades = pgd_attack_use_trades
 
   def _build(self, labels):
+    self._build_nominal_loss(labels)
+    self._build_verified_loss(labels)
+    self._build_attack_loss(labels)
+
+  def _build_nominal_loss(self, labels):
+    """Build natural cross-entropy loss on clean data."""
     # Cross-entropy.
     nominal_logits = self._predictor.logits
     if self._label_smoothing > 0:
@@ -96,6 +98,7 @@ class Losses(snt.AbstractModule):
       one_hot_labels = one_hot_labels * smooth_positives + smooth_negatives
       nominal_cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(
           labels=one_hot_labels, logits=nominal_logits)
+      self._one_hot_labels = one_hot_labels
     else:
       nominal_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
           labels=labels, logits=nominal_logits)
@@ -105,84 +108,87 @@ class Losses(snt.AbstractModule):
     self._nominal_accuracy = tf.reduce_mean(
         tf.cast(nominal_correct_examples, tf.float32))
 
-    # Interval bounds.
-    if self._specification:
-      bounds = self._specification(self._predictor.modules)
-      v = tf.reduce_max(bounds, axis=1)
-      self._interval_bounds_accuracy = tf.reduce_mean(
-          tf.cast(v <= 0., tf.float32))
-      # Select specifications.
-      if self._interval_bounds_loss_mode == 'all':
-        pass  # Keep bounds the way it is.
-      elif self._interval_bounds_loss_mode == 'most':
-        bounds = tf.reduce_max(bounds, axis=1, keepdims=True)
-      elif self._interval_bounds_loss_mode == 'random':
-        idx = tf.random.uniform(
-            [tf.shape(bounds)[0], self._interval_bounds_loss_n],
-            0, tf.shape(bounds)[1], dtype=tf.int32)
-        bounds = tf.batch_gather(bounds, idx)
-      else:
-        assert self._interval_bounds_loss_mode == 'least'
-        # This picks the least violated contraint.
-        mask = tf.cast(bounds < 0., tf.float32)
-        smallest_violation = tf.reduce_min(
-            bounds + mask * _BIG_NUMBER, axis=1, keepdims=True)
-        has_violations = tf.less(
-            tf.reduce_sum(mask, axis=1, keepdims=True) + .5,
-            tf.cast(tf.shape(bounds)[1], tf.float32))
-        largest_bounds = tf.reduce_max(bounds, axis=1, keepdims=True)
-        bounds = tf.where(has_violations, smallest_violation, largest_bounds)
+  def _get_specification_bounds(self):
+    """Get upper bounds on specification. Used for building verified loss."""
+    ibp_bounds = self._specification(self._predictor.modules)
+    # Compute verified accuracy using IBP bounds.
+    v = tf.reduce_max(ibp_bounds, axis=1)
+    self._interval_bounds_accuracy = tf.reduce_mean(
+        tf.cast(v <= 0., tf.float32))
+    return ibp_bounds
 
-      if self._interval_bounds_loss_type == 'xent':
-        v = tf.concat(
-            [bounds, tf.zeros([tf.shape(bounds)[0], 1], dtype=bounds.dtype)],
-            axis=1)
-        l = tf.concat(
-            [tf.zeros_like(bounds),
-             tf.ones([tf.shape(bounds)[0], 1], dtype=bounds.dtype)],
-            axis=1)
-        self._verified_loss = tf.reduce_mean(
-            tf.nn.softmax_cross_entropy_with_logits_v2(
-                labels=tf.stop_gradient(l), logits=v))
-      elif self._interval_bounds_loss_type == 'softplus':
-        self._verified_loss = tf.reduce_mean(
-            tf.nn.softplus(bounds + self._interval_bounds_hinge_margin))
-      else:
-        assert self._interval_bounds_loss_type == 'hinge'
-        self._verified_loss = tf.reduce_mean(
-            tf.maximum(bounds, -self._interval_bounds_hinge_margin))
-    else:
+  def _build_verified_loss(self, labels):
+    """Build verified loss using an upper bound on specification."""
+    if not self._specification:
       self._verified_loss = tf.constant(0.)
       self._interval_bounds_accuracy = tf.constant(0.)
-
-    # PGD attack.
-    if self._attack:
-      if not isinstance(self._predictor.inputs, tf.Tensor):
-        raise ValueError('Multiple inputs is not supported.')
-      self._attack(self._predictor.inputs, labels)
-      correct_examples = tf.equal(labels, tf.argmax(self._attack.logits, 1))
-      self._attack_accuracy = tf.reduce_mean(
-          tf.cast(correct_examples, tf.float32))
-      self._attack_success = tf.reduce_mean(
-          tf.cast(self._attack.success, tf.float32))
-      if self._pgd_attack_use_trades:
-        # The variable is misnamed in this case.
-        nominal_logits = tf.stop_gradient(nominal_logits)
-        attack_cross_entropy = tfp.distributions.kl_divergence(
-            tfp.distributions.Categorical(logits=nominal_logits),
-            tfp.distributions.Categorical(logits=self._attack.logits))
-      else:
-        if self._label_smoothing > 0:
-          attack_cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(
-              labels=one_hot_labels, logits=self._attack.logits)
-        else:
-          attack_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-              labels=labels, logits=self._attack.logits)
-      self._attack_cross_entropy = tf.reduce_mean(attack_cross_entropy)
+      return
+    # Interval bounds.
+    bounds = self._get_specification_bounds()
+    # Select specifications.
+    if self._interval_bounds_loss_mode == 'all':
+      pass  # Keep bounds the way it is.
+    elif self._interval_bounds_loss_mode == 'most':
+      bounds = tf.reduce_max(bounds, axis=1, keepdims=True)
+    elif self._interval_bounds_loss_mode == 'random':
+      idx = tf.random.uniform(
+          [tf.shape(bounds)[0], self._interval_bounds_loss_n],
+          0, tf.shape(bounds)[1], dtype=tf.int32)
+      bounds = tf.batch_gather(bounds, idx)
     else:
+      assert self._interval_bounds_loss_mode == 'least'
+      # This picks the least violated contraint.
+      mask = tf.cast(bounds < 0., tf.float32)
+      smallest_violation = tf.reduce_min(
+          bounds + mask * _BIG_NUMBER, axis=1, keepdims=True)
+      has_violations = tf.less(
+          tf.reduce_sum(mask, axis=1, keepdims=True) + .5,
+          tf.cast(tf.shape(bounds)[1], tf.float32))
+      largest_bounds = tf.reduce_max(bounds, axis=1, keepdims=True)
+      bounds = tf.where(has_violations, smallest_violation, largest_bounds)
+
+    if self._interval_bounds_loss_type == 'xent':
+      v = tf.concat(
+          [bounds, tf.zeros([tf.shape(bounds)[0], 1], dtype=bounds.dtype)],
+          axis=1)
+      l = tf.concat(
+          [tf.zeros_like(bounds),
+           tf.ones([tf.shape(bounds)[0], 1], dtype=bounds.dtype)],
+          axis=1)
+      self._verified_loss = tf.reduce_mean(
+          tf.nn.softmax_cross_entropy_with_logits_v2(
+              labels=tf.stop_gradient(l), logits=v))
+    elif self._interval_bounds_loss_type == 'softplus':
+      self._verified_loss = tf.reduce_mean(
+          tf.nn.softplus(bounds + self._interval_bounds_hinge_margin))
+    else:
+      assert self._interval_bounds_loss_type == 'hinge'
+      self._verified_loss = tf.reduce_mean(
+          tf.maximum(bounds, -self._interval_bounds_hinge_margin))
+
+  def _build_attack_loss(self, labels):
+    """Build adversarial loss using PGD attack."""
+    # PGD attack.
+    if not self._attack:
       self._attack_accuracy = tf.constant(0.)
       self._attack_success = tf.constant(1.)
       self._attack_cross_entropy = tf.constant(0.)
+      return
+    if not isinstance(self._predictor.inputs, tf.Tensor):
+      raise ValueError('Multiple inputs is not supported.')
+    self._attack(self._predictor.inputs, labels)
+    correct_examples = tf.equal(labels, tf.argmax(self._attack.logits, 1))
+    self._attack_accuracy = tf.reduce_mean(
+        tf.cast(correct_examples, tf.float32))
+    self._attack_success = tf.reduce_mean(
+        tf.cast(self._attack.success, tf.float32))
+    if self._label_smoothing > 0:
+      attack_cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(
+          labels=self._one_hot_labels, logits=self._attack.logits)
+    else:
+      attack_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+          labels=labels, logits=self._attack.logits)
+    self._attack_cross_entropy = tf.reduce_mean(attack_cross_entropy)
 
   @property
   def scalar_metrics(self):
