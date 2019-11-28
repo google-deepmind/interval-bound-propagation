@@ -26,7 +26,7 @@ import six
 import sonnet as snt
 import tensorflow as tf
 
-nest = tf.contrib.framework.nest
+nest = tf.nest
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -84,8 +84,7 @@ class UnrolledGradientDescent(UnrolledOptimizer):
   def minimize(self, loss, x, optim_state):
     """Refer to parent class documentation."""
     lr = self._lr_fn(optim_state.iteration)
-    grads = tf.gradients(
-        loss, x, colocate_gradients_with_ops=self._colocate_gradients_with_ops)
+    grads = self.gradients(loss, x)
     if self._fgsm:
       grads = [tf.sign(g) for g in grads]
     new_x = [None] * len(x)
@@ -93,6 +92,10 @@ class UnrolledGradientDescent(UnrolledOptimizer):
       new_x[i] = x[i] - lr * grads[i]
     new_optim_state = self._State(optim_state.iteration + 1)
     return new_x, new_optim_state
+
+  def gradients(self, loss, x):
+    return tf.gradients(
+        loss, x, colocate_gradients_with_ops=self._colocate_gradients_with_ops)
 
 
 # Syntactic sugar.
@@ -126,7 +129,7 @@ class UnrolledAdam(UnrolledOptimizer):
         u=[tf.zeros_like(v) for v in x])
 
   def _apply_gradients(self, grads, x, optim_state):
-    """Refer to parent class documentation."""
+    """Applies gradients."""
     lr = self._lr_fn(optim_state.t)
     new_optim_state = self._State(
         t=optim_state.t + 1,
@@ -154,7 +157,119 @@ class UnrolledAdam(UnrolledOptimizer):
         loss, x, colocate_gradients_with_ops=self._colocate_gradients_with_ops)
 
 
-class UnrolledSPSAAdam(UnrolledAdam):
+def _spsa_gradients(loss_fn, x, delta=0.01, num_samples=16, num_iterations=4):
+  """Compute gradient estimates using SPSA.
+
+  Args:
+    loss_fn: Callable that takes a single argument of shape [batch_size, ...]
+      and returns the loss contribution of each element of the batch as a
+      tensor of shape [batch_size].
+    x: List of tensors with a single element. We only support computation of
+      the gradient of the loss with respect to x[0]. We take a list as input to
+      keep the same API call as tf.gradients.
+    delta: The gradients are computed by computing the loss within x - delta and
+      x + delta.
+    num_samples: The total number of random samples used to compute the gradient
+      is `num_samples` times `num_iterations`. `num_samples` contributes to the
+      gradient by tiling `x` `num_samples` times.
+    num_iterations: The total number of random samples used to compute the
+      gradient is `num_samples` times `num_iterations`. `num_iterations`
+      contributes to the gradient by iterating using a `tf.while_loop`.
+
+  Returns:
+    List of tensors with a single element corresponding to the gradient of
+    loss_fn(x[0]) with respect to x[0].
+  """
+
+  if len(x) != 1:
+    raise NotImplementedError('SPSA gradients with respect to multiple '
+                              'variables is not supported.')
+  # loss_fn takes a single argument.
+  tensor = x[0]
+
+  def _get_delta(x):
+    return delta * tf.sign(
+        tf.random_uniform(tf.shape(x), minval=-1., maxval=1., dtype=x.dtype))
+
+  # Process batch_size samples at a time.
+  def cond(i, *_):
+    return tf.less(i, num_iterations)
+
+  def loop_body(i, total_grad):
+    """Compute gradient estimate."""
+    batch_size = tf.shape(tensor)[0]
+    # The tiled tensor has shape [num_samples, batch_size, ...]
+    tiled_tensor = tf.expand_dims(tensor, axis=0)
+    tiled_tensor = tf.tile(tiled_tensor,
+                           [num_samples] + [1] * len(tensor.shape))
+    # The tiled tensor has now shape [2, num_samples, batch_size, ...].
+    delta = _get_delta(tiled_tensor)
+    tiled_tensor = tf.stack(
+        [tiled_tensor + delta, tiled_tensor - delta], axis=0)
+    # Compute loss with shape [2, num_samples, batch_size].
+    losses = loss_fn(
+        tf.reshape(tiled_tensor,
+                   [2 * num_samples, batch_size] + tensor.shape.as_list()[1:]))
+    losses = tf.reshape(losses, [2, num_samples, batch_size])
+
+    # Compute approximate gradient using broadcasting.
+    shape = losses.shape.as_list() + [1] * (len(tensor.shape) - 1)
+    shape = [(s or -1) for s in shape]  # Remove None.
+    losses = tf.reshape(losses, shape)
+    g = tf.reduce_mean((losses[0] - losses[1]) / (2. * delta), axis=0)
+    return [i + 1, g / num_iterations + total_grad]
+
+  _, g = tf.while_loop(
+      cond,
+      loop_body,
+      loop_vars=[tf.constant(0.), tf.zeros_like(tensor)],
+      parallel_iterations=1,
+      back_prop=False)
+  return [g]
+
+
+@six.add_metaclass(abc.ABCMeta)
+class UnrolledSPSA(object):
+  """Abstract class that represents an optimizer based on SPSA."""
+
+
+class UnrolledSPSAGradientDescent(UnrolledGradientDescent, UnrolledSPSA):
+  """Optimizer for gradient-free attacks in https://arxiv.org/abs/1802.05666.
+
+  Gradients estimates are computed using Simultaneous Perturbation Stochastic
+  Approximation (SPSA).
+  """
+
+  def __init__(self, lr=0.1, lr_fn=None, fgsm=False,
+               colocate_gradients_with_ops=False, delta=0.01, num_samples=32,
+               num_iterations=4, loss_fn=None):
+    super(UnrolledSPSAGradientDescent, self).__init__(
+        lr, lr_fn, fgsm, colocate_gradients_with_ops)
+    assert num_samples % 2 == 0, 'Number of samples must be even'
+    self._delta = delta
+    self._num_samples = num_samples // 2  # Since we mirror +/- delta later.
+    self._num_iterations = num_iterations
+    assert loss_fn is not None, 'loss_fn must be specified.'
+    self._loss_fn = loss_fn
+
+  def gradients(self, loss, x):
+    return _spsa_gradients(self._loss_fn, x, self._delta, self._num_samples,
+                           self._num_iterations)
+
+
+# Syntactic sugar.
+class UnrolledSPSAFGSMDescent(UnrolledSPSAGradientDescent):
+  """Identical to UnrolledSPSAGradientDescent but forces FGSM steps."""
+
+  def __init__(self, lr=.1, lr_fn=None,
+               colocate_gradients_with_ops=False, delta=0.01, num_samples=32,
+               num_iterations=4, loss_fn=None):
+    super(UnrolledSPSAFGSMDescent, self).__init__(
+        lr, lr_fn, True, colocate_gradients_with_ops, delta, num_samples,
+        num_iterations, loss_fn)
+
+
+class UnrolledSPSAAdam(UnrolledAdam, UnrolledSPSA):
   """Optimizer for gradient-free attacks in https://arxiv.org/abs/1802.05666.
 
   Gradients estimates are computed using Simultaneous Perturbation Stochastic
@@ -173,52 +288,25 @@ class UnrolledSPSAAdam(UnrolledAdam):
     assert loss_fn is not None, 'loss_fn must be specified.'
     self._loss_fn = loss_fn
 
-  def _get_delta(self, x):
-    return self._delta * tf.sign(
-        tf.random_uniform(tf.shape(x), minval=-1., maxval=1., dtype=x.dtype))
-
   def gradients(self, loss, x):
-    """Compute gradient estimates using SPSA."""
-    # Process batch_size samples at a time.
-    def cond(i, *_):
-      return tf.less(i, self._num_iterations)
+    return _spsa_gradients(self._loss_fn, x, self._delta, self._num_samples,
+                           self._num_iterations)
 
-    def loop_body(i, *total_grads):
-      """Compute gradient estimate."""
-      new_grads = []
-      for j, tensor in enumerate(x):
-        batch_size = tf.shape(tensor)[0]
-        # The tiled tensor has shape [num_samples, batch_size, ...]
-        tiled_tensor = tf.expand_dims(tensor, axis=0)
-        tiled_tensor = tf.tile(tiled_tensor,
-                               [self._num_samples] + [1] * len(tensor.shape))
-        # The tiled tensor has now shape [num_samples, 2, batch_size, ...].
-        delta = self._get_delta(tiled_tensor)
-        tiled_tensor = tf.stack([tiled_tensor + delta, tiled_tensor - delta],
-                                axis=1)
-        # Compute loss with shape [num_samples, 2, batch_size].
-        losses = self._loss_fn(
-            tf.reshape(tiled_tensor, ([self._num_samples * 2 * batch_size] +
-                                      tensor.shape.as_list()[1:])))
-        losses = tf.reshape(losses, [self._num_samples, 2, batch_size])
 
-        # Compute approximate gradient using broadcasting.
-        shape = losses.shape.as_list() + [1] * (len(tensor.shape) - 1)
-        shape = [(s or -1) for s in shape]  # Remove None.
-        losses = tf.reshape(losses, shape)
-        g = tf.reduce_mean((losses[:, 0, :] - losses[:, 1, :]) / (2. * delta),
-                           axis=0)
-        new_grads.append(g + total_grads[j])
-      return [i + 1] + new_grads
+def _is_spsa_optimizer(cls):
+  return issubclass(cls, UnrolledSPSA)
 
-    results = tf.while_loop(
-        cond,
-        loop_body,
-        loop_vars=[tf.constant(0.)] + [tf.zeros_like(v) for v in x],
-        parallel_iterations=1,
-        back_prop=False)
-    num_iterations = results[0]
-    return [g / num_iterations for g in results[1:]]
+
+def wrap_optimizer(cls, **default_kwargs):
+  """Wraps an optimizer such that __init__ uses the specified kwargs."""
+
+  class WrapperUnrolledOptimizer(cls):
+
+    def __init__(self, *args, **kwargs):
+      new_kwargs = default_kwargs.copy()
+      new_kwargs.update(kwargs)
+      super(WrapperUnrolledOptimizer, self).__init__(*args, **new_kwargs)
+  return WrapperUnrolledOptimizer
 
 
 def _project_perturbation(perturbation, epsilon, input_image, image_bounds):
@@ -305,6 +393,7 @@ class Attack(snt.AbstractModule):
     else:
       self._kwargs = predictor_kwargs
     self._forced_mode = None
+    self._target_class = None
 
   def _eval_fn(self, x, mode='intermediate'):
     """Runs the logits corresponding to `x`.
@@ -340,6 +429,15 @@ class Attack(snt.AbstractModule):
   def force_mode(self, mode):
     """Only used by RestartedAttack to force the evaluation mode."""
     self._forced_mode = mode
+
+  @property
+  def target_class(self):
+    """Returns the target class if this attack is a targeted attacks."""
+    return self._target_class
+
+  @target_class.setter
+  def target_class(self, t):
+    self._target_class = t
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -448,7 +546,14 @@ class UntargetedPGDAttack(PGDAttack):
       return self._objective_fn(bounds)
 
     # Only used for SPSA.
-    def spsa_loss_fn(x):
+    # The input to this loss is the perturbation (not the image).
+    # The first dimension corresponds to the number of SPSA samples.
+    # Shape of perturbations is [num_samples, restarts * batch_size, ...]
+    def spsa_loss_fn(perturbation):
+      """Computes the loss per SPSA sample."""
+      x = tf.reshape(
+          perturbation + tf.expand_dims(duplicated_inputs, axis=0),
+          [-1] + duplicated_inputs.shape.as_list()[1:])
       model_logits = self._eval_fn(x)
       num_outputs = tf.shape(model_logits)[1]
       model_logits = tf.reshape(
@@ -462,7 +567,7 @@ class UntargetedPGDAttack(PGDAttack):
       return -tf.reduce_sum(objective_fn(x))
 
     # Use targeted attacks as specified by the specification.
-    if self._optimizer_builder == UnrolledSPSAAdam:
+    if _is_spsa_optimizer(self._optimizer_builder):
       optimizer = self._optimizer_builder(lr=self._lr, lr_fn=self._lr_fn,
                                           loss_fn=spsa_loss_fn)
     else:
@@ -615,8 +720,8 @@ class MultiTargetedPGDAttack(PGDAttack):
       return -tf.reduce_sum(select_fn(objective_fn(x)))
 
     # Use targeted attacks as specified by the specification.
-    if self._optimizer_builder == UnrolledSPSAAdam:
-      raise ValueError('"UnrolledSPSAAdam" unsupported in '
+    if _is_spsa_optimizer(self._optimizer_builder):
+      raise ValueError('"UnrolledSPSA*" unsupported in '
                        'MultiTargetedPGDAttack')
     optimizer = self._optimizer_builder(lr=self._lr, lr_fn=self._lr_fn)
     adversarial_input = pgd_attack(
@@ -713,8 +818,8 @@ class MemoryEfficientMultiTargetedPGDAttack(PGDAttack):
         return -tf.reduce_sum(select_fn(objective_fn(x), idx))
       return _reduced_loss_fn
 
-    if self._optimizer_builder == UnrolledSPSAAdam:
-      raise ValueError('"UnrolledSPSAAdam" unsupported in '
+    if _is_spsa_optimizer(self._optimizer_builder):
+      raise ValueError('"UnrolledSPSA*" unsupported in '
                        'MultiTargetedPGDAttack')
     optimizer = self._optimizer_builder(lr=self._lr, lr_fn=self._lr_fn)
 

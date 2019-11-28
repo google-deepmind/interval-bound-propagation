@@ -29,8 +29,10 @@ import tensorflow as tf
 
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string('dataset', 'mnist', 'Dataset (either "mnist" or "cifar10")')
-flags.DEFINE_string('model', 'tiny', 'Model size')
+flags.DEFINE_enum('dataset', 'mnist', ['mnist', 'cifar10'],
+                  'Dataset (either "mnist" or "cifar10").')
+flags.DEFINE_enum('model', 'tiny', ['tiny', 'small', 'medium', 'large'],
+                  'Model size.')
 flags.DEFINE_string('output_dir', '/tmp/ibp_model', 'Output directory.')
 
 # Options.
@@ -116,7 +118,7 @@ def layers(model_size):
         ('activation', 'relu'),
         ('conv2d', (3, 3), 128, 'SAME', 1),
         ('activation', 'relu'),
-        ('linear', 200),
+        ('linear', 512),
         ('activation', 'relu'))
   else:
     raise ValueError('Unknown model: "{}"'.format(model_size))

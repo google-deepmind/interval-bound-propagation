@@ -603,8 +603,7 @@ class DNN(snt.AbstractModule):
     self._layer_types = list(layer_types)
     self._layer_types.append(('linear', num_classes))
     if l2_regularization_scale > 0.:
-      regularizer = tf.contrib.layers.l2_regularizer(
-          scale=l2_regularization_scale)
+      regularizer = tf.keras.regularizers.l2(l=0.5*l2_regularization_scale)
       self._regularizers = {'w': regularizer}
     else:
       self._regularizers = None

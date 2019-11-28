@@ -31,6 +31,8 @@ from interval_bound_propagation.src.attacks import UnrolledAdam
 from interval_bound_propagation.src.attacks import UnrolledFGSMDescent
 from interval_bound_propagation.src.attacks import UnrolledGradientDescent
 from interval_bound_propagation.src.attacks import UnrolledSPSAAdam
+from interval_bound_propagation.src.attacks import UnrolledSPSAFGSMDescent
+from interval_bound_propagation.src.attacks import UnrolledSPSAGradientDescent
 from interval_bound_propagation.src.attacks import UntargetedAdaptivePGDAttack
 from interval_bound_propagation.src.attacks import UntargetedPGDAttack
 from interval_bound_propagation.src.attacks import UntargetedTop5PGDAttack
@@ -81,4 +83,4 @@ from interval_bound_propagation.src.verifiable_wrapper import PiecewiseMonotonic
 from interval_bound_propagation.src.verifiable_wrapper import VerifiableWrapper
 
 
-__version__ = '1.00'
+__version__ = '1.10'

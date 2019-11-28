@@ -460,7 +460,7 @@ def get_attack_builder(logits, label, name='UntargetedPGDAttack',
 
 def create_attack(attack_config, predictor, label, epsilon,
                   input_bounds=(0., 1.), random_init=1., random_seed=None,
-                  predictor_kwargs=None):
+                  predictor_kwargs=None, logits=None):
   """Creates an attack from a textual configuration.
 
   Args:
@@ -476,13 +476,28 @@ def create_attack(attack_config, predictor, label, epsilon,
       nominal input image.
     random_seed: Sets the random seed for "Random*" attacks.
     predictor_kwargs: Dict of arguments passed to the predictor network.
+    logits: Logits corresponding to the nominal inputs. If None, it assumes that
+      predictor has a property named `logits`.
 
   Returns:
     An Attack instance.
   """
   if attack_config:
-    name, steps_and_restarts, optimizer, step_size = attack_config.split('_', 3)
+    name, steps_and_restarts, optimizer, step_size = re.split(
+        r'_\s*(?![^()]*\))', attack_config, maxsplit=3)
+    # Optimizers can specify contructor arguments using
+    # (arg1=value1;arg2=value2) syntax.
+    m = re.match(r'([^\(]*)\(([^\)]*)\)', optimizer)
+    if m is not None:
+      optimizer = m.group(1)
+      kwargs = 'dict(' + m.group(2).replace(';', ',') + ')'
+      kwargs = eval(kwargs)  # pylint: disable=eval-used
+    else:
+      kwargs = {}
     optimizer = getattr(attacks, optimizer)
+    # Wrap optimizer if needed.
+    if kwargs:
+      optimizer = attacks.wrap_optimizer(optimizer, **kwargs)
     num_steps, inner_restarts, outer_restarts = (
         int(i) for i in steps_and_restarts.split('x', 3))
     step_size = step_size.replace(':', ',')
@@ -497,13 +512,16 @@ def create_attack(attack_config, predictor, label, epsilon,
   def attack_learning_rate_fn(t):
     return parse_learning_rate(t, step_size)
 
-  attack_cls, attack_specification, _ = get_attack_builder(
-      predictor.logits, label, name=name, random_seed=random_seed)
+  if logits is None:
+    logits = predictor.logits
+  attack_cls, attack_specification, target_class = get_attack_builder(
+      logits, label, name=name, random_seed=random_seed)
   attack_strategy = attack_cls(
       predictor, attack_specification, epsilon, num_steps=num_steps,
       num_restarts=inner_restarts, input_bounds=input_bounds,
       optimizer_builder=optimizer, lr_fn=attack_learning_rate_fn,
       random_init=random_init, predictor_kwargs=predictor_kwargs)
+  attack_strategy.target_class = target_class
   if outer_restarts > 1:
     attack_strategy = attacks.RestartedAttack(
         attack_strategy, num_restarts=outer_restarts)
