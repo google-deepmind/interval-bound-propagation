@@ -28,7 +28,7 @@ You should expect to see the following at the end of training
 (note we only use SST dev set only for evaluation here).
 
 ```bash
-step: 149900, train loss: 0.392112, dual train loss: 0.826042,
+step: 149900, train loss: 0.392112, verifiable train loss: 0.826042,
 train accuracy: 0.850000, dev accuracy: 0.747619, test accuracy: 0.747619,
 Train Bound = -0.42432, train verified: 0.800,
 dev verified: 0.695, test verified: 0.695

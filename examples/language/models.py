@@ -58,7 +58,8 @@ class SentenceRepresenterConv(snt.AbstractModule):
           x = _max_pool_1d(x, pooling_size)
       elif layer == 'relu':
         x = tf.nn.relu(x)
-        x = tf.nn.dropout(x, keep_prob=self._keep_prob)
+        if self._keep_prob < 1:
+          x = tf.nn.dropout(x, keep_prob=self._keep_prob)
       else:
         raise RuntimeError('Bad layer type {} in conv'.format(layer))
     # Final layer pools over the remaining sequence length to get a
@@ -73,12 +74,13 @@ class SentenceRepresenterConv(snt.AbstractModule):
     if self._config['conv_fc1']:
       fc1_layer = snt.Linear(output_size=self._config['conv_fc1'])
       x = tf.nn.relu(fc1_layer(x))
-      x = tf.nn.dropout(x, keep_prob=self._keep_prob)
-
+      if self._keep_prob < 1:
+        x = tf.nn.dropout(x, keep_prob=self._keep_prob)
     if self._config['conv_fc2']:
       fc2_layer = snt.Linear(output_size=self._config['conv_fc2'])
       x = tf.nn.relu(fc2_layer(x))
-      x = tf.nn.dropout(x, keep_prob=self._keep_prob)
+      if self._keep_prob < 1:
+        x = tf.nn.dropout(x, keep_prob=self._keep_prob)
 
     return x
 
