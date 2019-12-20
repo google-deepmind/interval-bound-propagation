@@ -43,7 +43,7 @@ import interactive_example
 
 flags.DEFINE_boolean('character_level', True, 'Character level model.')
 flags.DEFINE_boolean('debug_mode', False, 'Debug mode.')
-flags.DEFINE_string('checkpoint_path', '/tmp/ibp_nlp/best_verified',
+flags.DEFINE_string('checkpoint_path', '/tmp/robust_model/checkpoint/final',
                     'Checkpoint path.')
 flags.DEFINE_string('dataset', 'sst', 'Dataset name. train, dev, or test.')
 flags.DEFINE_string('mode', 'validation', 'Dataset part. train, dev, or test.')

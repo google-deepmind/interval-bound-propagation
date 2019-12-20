@@ -9,8 +9,8 @@ Propagation](https://arxiv.org/abs/1909.01492).
 The installation can be done with the following commands:
 
 ```bash
-pip install "tensorflow-gpu<2" "dm-sonnet<2" "tensorflow-probability==0.7.0" "tensorflow-datasets" "absl-py"
-pip install git+https://github.com/deepmind/interval-bound-propagation
+pip3 install "tensorflow-gpu<2" "dm-sonnet<2" "tensorflow-probability==0.7.0" "tensorflow-datasets" "absl-py"
+pip3 install git+https://github.com/deepmind/interval-bound-propagation
 ```
 
 

@@ -5,7 +5,8 @@ This repository contains a simple implementation of Interval Bound Propagation
 [https://arxiv.org/abs/1810.12715](https://arxiv.org/abs/1810.12715).
 It also contains an implementation of CROWN-IBP:
 [https://arxiv.org/abs/1906.06316](https://arxiv.org/abs/1906.06316).
-It also contains a sentiment analysis example under `examples/language` for [https://arxiv.org/abs/1909.01492](https://arxiv.org/abs/1909.01492).
+It also contains a sentiment analysis example under [`examples/language`](https://github.com/deepmind/interval-bound-propagation/tree/master/examples/language) 
+for [https://arxiv.org/abs/1909.01492](https://arxiv.org/abs/1909.01492).
 
 This is not an official Google product
 

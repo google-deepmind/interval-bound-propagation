@@ -50,7 +50,6 @@ flags.DEFINE_float('max_grad_norm', 5.0, 'Maximum norm of gradients.')
 flags.DEFINE_boolean('fine_tune_embeddings', True, 'Finetune embeddings.')
 flags.DEFINE_string('task', 'sst', 'One of snli, mnli, sick, sst.')
 flags.DEFINE_string('pooling', 'average', 'One of averge, sum, max, last.')
-flags.DEFINE_boolean('evaluate', False, 'Evaluate mode.')
 flags.DEFINE_boolean('analysis', False, 'Analysis mode.')
 flags.DEFINE_string('analysis_split', 'test', 'Analysis dataset split.')
 flags.DEFINE_string('experiment_root',
@@ -289,29 +288,6 @@ def train(config_dict, synonym_filepath,
                        os.path.join(checkpoint_path, 'final'))
 
 
-def evaluate(config_dict, model_location):
-  """Get the accuracy on the test set."""
-  graph_tensor_producer = robust_model.RobustModel(**config_dict)
-  graph_tensors = graph_tensor_producer()
-  input_feed = {}
-
-  network_saver = tf.train.Saver(graph_tensor_producer.variables)
-  with tf.train.SingularMonitoredSession() as session:
-    network_saver.restore(session.raw_session(), model_location)
-
-    for datasplit in ['dev', 'test']:
-      total_num_correct = 0.0
-      total_num_batches = (graph_tensors['%s_num_examples' % datasplit]
-                           // graph_tensor_producer.batch_size)
-      total_num_examples = total_num_batches * graph_tensor_producer.batch_size
-      logging.info('total number of examples  %d', total_num_examples)
-      for _ in range(total_num_batches):
-        total_num_correct += session.run(
-            graph_tensors['%s_num_correct' % datasplit], input_feed)
-      logging.info('%s accuracy %f', datasplit,
-                   total_num_correct / total_num_examples)
-
-
 def analysis(config_dict, synonym_filepath,
              model_location, batch_size, batch_offset=0,
              total_num_batches=0, datasplit='test', delta=3.0,
@@ -440,9 +416,6 @@ def main(_):
              delta=config['delta'],
              num_perturbations=config['num_perturbations'],
              max_padded_length=config['max_padded_length'])
-
-  elif FLAGS.evaluate:
-    evaluate(config_dict, config['model_location'])
 
   else:
     checkpoint_path = os.path.join(FLAGS.experiment_root, 'checkpoint')
