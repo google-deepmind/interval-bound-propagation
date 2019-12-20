@@ -29,7 +29,7 @@ from interval_bound_propagation.src import model
 from interval_bound_propagation.src import specification as specification_lib
 from interval_bound_propagation.src import utils
 from interval_bound_propagation.src import verifiable_wrapper
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class BackwardBounds(bounds.AbstractBounds):

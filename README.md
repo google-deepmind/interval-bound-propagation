@@ -5,6 +5,7 @@ This repository contains a simple implementation of Interval Bound Propagation
 [https://arxiv.org/abs/1810.12715](https://arxiv.org/abs/1810.12715).
 It also contains an implementation of CROWN-IBP:
 [https://arxiv.org/abs/1906.06316](https://arxiv.org/abs/1906.06316).
+It also contains a sentiment analysis example under `examples/language` for [https://arxiv.org/abs/1909.01492](https://arxiv.org/abs/1909.01492).
 
 This is not an official Google product
 
@@ -91,6 +92,13 @@ Huan Zhang, Hongge Chen, Chaowei Xiao, Sven Gowal, Robert Stanforth, Bo Li,
 Duane Boning, Cho-Jui Hsieh.
 "Towards Stable and Efficient Training of Verifiably Robust Neural Networks."
 _arXiv preprint arXiv:1906.06316 (2019)_.
+
+If you use the sentiment analysis example, please cite:
+
+Po-Sen Huang, Robert Stanforth, Johannes Welbl, Chris Dyer, Dani Yogatama, Sven Gowal, Krishnamurthy Dvijotham, Pushmeet Kohli.
+"Achieving Verified Robustness to Symbol Substitutions via Interval Bound Propagation."
+_EMNLP 2019_.
+
 
 ## Acknowledgements
 

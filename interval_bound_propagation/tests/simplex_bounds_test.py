@@ -23,7 +23,7 @@ from absl.testing import parameterized
 import interval_bound_propagation as ibp
 from interval_bound_propagation import layer_utils
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class SimplexBoundsTest(tf.test.TestCase, parameterized.TestCase):

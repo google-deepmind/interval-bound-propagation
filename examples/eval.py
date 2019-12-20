@@ -23,7 +23,7 @@ from absl import app
 from absl import flags
 from absl import logging
 import interval_bound_propagation as ibp
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 FLAGS = flags.FLAGS

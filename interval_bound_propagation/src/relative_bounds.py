@@ -21,7 +21,7 @@ from __future__ import print_function
 
 from interval_bound_propagation.src import bounds as basic_bounds
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class RelativeIntervalBounds(basic_bounds.AbstractBounds):

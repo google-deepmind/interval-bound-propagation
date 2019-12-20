@@ -21,7 +21,7 @@ from __future__ import print_function
 
 import interval_bound_propagation as ibp
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def _get_inputs(dtype=tf.float32):

@@ -29,7 +29,7 @@ from interval_bound_propagation.src import layers
 from interval_bound_propagation.src import loss
 from interval_bound_propagation.src import specification
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 # Defines a dataset sample."""

@@ -20,7 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 # Slightly altered version of snt.BatchNorm that allows to easily grab which

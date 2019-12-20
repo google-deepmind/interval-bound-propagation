@@ -24,7 +24,7 @@ import interval_bound_propagation as ibp
 from interval_bound_propagation import layer_utils
 import numpy as np
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class RelativeIntervalBoundsTest(tf.test.TestCase, parameterized.TestCase):

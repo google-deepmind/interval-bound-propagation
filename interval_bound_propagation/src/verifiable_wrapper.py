@@ -26,7 +26,7 @@ from absl import logging
 from interval_bound_propagation.src import layers
 import six
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 @six.add_metaclass(abc.ABCMeta)

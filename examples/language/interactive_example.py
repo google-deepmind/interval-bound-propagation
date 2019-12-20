@@ -22,10 +22,11 @@ from __future__ import print_function
 
 import collections
 
-from interval_bound_propagation.examples.language import robust_model
 import numpy as np
 from six.moves import range
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+
+import robust_model
 
 
 SparseTensorValue = collections.namedtuple(
@@ -71,7 +72,7 @@ class InteractiveSentimentPredictor(object):
         integers, representing model predictions for each input.
     """
 
-    # prepare inputs
+    # Prepare inputs.
     tokenised_sentence_list = []
     for sentence in list_of_sentences:
       if not is_tokenised:
@@ -83,17 +84,17 @@ class InteractiveSentimentPredictor(object):
     assert all([len(x) == length for x in tokenised_sentence_list])
     assert len(tokenised_sentence_list) == self.batch_size
 
-    # construct sparse tensor holding token information
+    # Construct sparse tensor holding token information.
     indices = np.zeros([self.batch_size*length, 2])
     dense_shape = [self.batch_size, length]
-    # loop over words. All sentences have the same length
+    # Loop over words. All sentences have the same length.
     for j, _ in enumerate(tokenised_sentence_list[0]):
-      for i in range(self.batch_size):  # loop over samples
+      for i in range(self.batch_size):  # Loop over samples.
         offset = i*length + j
         indices[offset, 0] = i
         indices[offset, 1] = j
 
-    # define sparse tensor values
+    # Define sparse tensor values.
     tokenised_sentence_list = [word for sentence in tokenised_sentence_list  # pylint:disable=g-complex-comprehension
                                for word in sentence]
     values = np.array(tokenised_sentence_list)
@@ -101,12 +102,12 @@ class InteractiveSentimentPredictor(object):
                                   dense_shape=dense_shape)
     mb_num_tokens = np.array([length]*self.batch_size)
 
-    # fill feed_dict with input token information
+    # Fill feed_dict with input token information.
     feed_dict = {}
     feed_dict[self.graph_tensors['dev']['tokens']] = mb_tokens
     feed_dict[self.graph_tensors['dev']['num_tokens']] = mb_num_tokens
 
-    # generate model predictions [batch_size x n_labels]
+    # Generate model predictions [batch_size x n_labels].
     logits = self.open_session.run(self.graph_tensors['dev']['predictions'],
                                    feed_dict)
     batch_label_predictions = np.argmax(logits, axis=1)
@@ -115,15 +116,16 @@ class InteractiveSentimentPredictor(object):
 
   def predict_sentiment(self, sentence, tokenised=False):
     """Computes sentiment of a sentence."""
-    # create inputs to tensorflow graph
+    # Create inputs to tensorflow graph.
     if tokenised:
       inputstring_tokenised = sentence
     else:
       assert isinstance(sentence, str)
-      inputstring_tokenised = sentence.lower().split(' ')  # simple tokenisation
+      # Simple tokenisation.
+      inputstring_tokenised = sentence.lower().split(' ')
     length = len(inputstring_tokenised)
 
-    # construct inputs to sparse tensor holding token information
+    # Construct inputs to sparse tensor holding token information.
     indices = np.zeros([self.batch_size*length, 2])
     dense_shape = [self.batch_size, length]
     for j, _ in enumerate(inputstring_tokenised):
@@ -136,16 +138,15 @@ class InteractiveSentimentPredictor(object):
                                   dense_shape=dense_shape)
     mb_num_tokens = np.array([length]*self.batch_size)
 
-    # fill feeddict with input token information
+    # Fill feeddict with input token information.
     feed_dict = {}
     feed_dict[self.graph_tensors['dev']['tokens']] = mb_tokens
     feed_dict[self.graph_tensors['dev']['num_tokens']] = mb_num_tokens
-    # generate predictions
+    # Generate predictions.
     logits = self.open_session.run(self.graph_tensors['dev']['predictions'],
                                    feed_dict)
     predicted_label = np.argmax(logits, axis=1)
     final_prediction = predicted_label[0]
-    # check that prediction same everywhere (had batch of identical inputs)
+    # Check that prediction same everywhere (had batch of identical inputs).
     assert np.all(predicted_label == final_prediction)
     return final_prediction, logits
-

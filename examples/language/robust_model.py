@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train sentence representation models on individual tasks."""
+"""Train verifiable robust models."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -22,15 +22,16 @@ import collections
 
 from absl import logging
 import interval_bound_propagation as ibp
-from interval_bound_propagation.examples.language import models
-from interval_bound_propagation.examples.language import utils
 import numpy as np
 import six
 import sonnet as snt
-import tensorflow as tf
-from tensorflow.contrib import lookup as contrib_layers
-from tensorflow.contrib import lookup as contrib_lookup
+import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
+import tensorflow_probability as tfp
+
+from tensorflow.contrib import lookup as contrib_lookup
+import models
+import utils
 
 
 EmbeddedDataset = collections.namedtuple(
@@ -115,7 +116,7 @@ def parse(data_dict):
   sentence = data_dict['sentence']
   dense_chars = tf.decode_raw(sentence, tf.uint8)
   dense_chars.set_shape((None,))
-  chars = contrib_layers.dense_to_sparse(dense_chars)
+  chars = tfp.math.dense_to_sparse(dense_chars)
   if six.PY3:
     safe_chr = lambda c: '?' if c >= 128 else chr(c)
   else:
@@ -260,10 +261,10 @@ class RobustModel(snt.AbstractModule):
     # Defaults to same word in case of no other synonyms.
     synonym_ids = tf.gather(synonym_values, data_batch, axis=0)
 
-    # split along batchsize. Elements shape: [seq_length x max_num_synonyms]
+    # Split along batchsize. Elements shape: [seq_length x max_num_synonyms].
     synonym_ids_per_example = tf.unstack(synonym_ids, axis=0)
 
-    # loop across batch.
+    # Loop across batch.
     # synonym_ids_this_example shape: [seq_length x max_num_synonyms]
     sequence_positions_across_batch, values_across_batch = [], []
     for i_sample, synonym_ids_this_example in enumerate(
@@ -281,7 +282,7 @@ class RobustModel(snt.AbstractModule):
       # sequence.
       perturbation_positions_this_example = nonzero_indices[:, 0]
 
-      # the main logic is done. Now follows padding to a fixed length of
+      # The main logic is done. Now follows padding to a fixed length of
       # num_perturbations. However, this cannot be done with 0-padding, as it
       # would introduce a new (zero) vertex. Instead, we duplicate existing
       # tokens as perturbations (which have no effect), until we have reached a
@@ -301,7 +302,7 @@ class RobustModel(snt.AbstractModule):
       synonym_tokens_padded = tf.concat([synonym_tokens, tf.cast(padding_tokens,
                                                                  dtype=tf.int64)
                                         ], axis=0)
-      # crop at exact num_perturbations size.
+      # Crop at exact num_perturbations size.
       synonym_tokens_padded = synonym_tokens_padded[
           :self.config['num_perturbations']]
 
@@ -313,7 +314,7 @@ class RobustModel(snt.AbstractModule):
           [perturbation_positions_this_example, tf.cast(padding_positions,
                                                         dtype=tf.int64)],
           axis=0)
-      # crop at exact size num_perturbations.
+      # Crop at exact size num_perturbations.
       sequence_positions_padded = perturbation_positions_this_example_padded[
           :self.config['num_perturbations']]
 
@@ -321,11 +322,11 @@ class RobustModel(snt.AbstractModule):
       sequence_positions_across_batch.append(sequence_positions_padded)
       values_across_batch.append(synonym_tokens_padded)
 
-    # both [batch_size x max_n_perturbations]
+    # Both [batch_size x max_n_perturbations]
     perturbation_positions = tf.stack(sequence_positions_across_batch, axis=0)
     perturbation_tokens = tf.stack(values_across_batch, axis=0)
 
-    # explicitly setting the shape to self.config['num_perturbations']
+    # Explicitly setting the shape to self.config['num_perturbations']
     perturbation_positions_shape = perturbation_positions.shape.as_list()
     perturbation_positions_shape[1] = self.config['num_perturbations']
     perturbation_positions.set_shape(perturbation_positions_shape)
@@ -364,7 +365,17 @@ class RobustModel(snt.AbstractModule):
                           tf.cast(minibatch.num_tokens, tf.int32)),
         sentiment=minibatch.sentiment)
 
-  def compute_mask_vertices(self, data_batch, perturbation):  # pylint: disable=g-missing-docstring
+  def compute_mask_vertices(self, data_batch, perturbation):
+    """Compute perturbation masks and perbuted vertices.
+
+    Args:
+      data_batch: EmbeddedDataset object.
+      perturbation: Perturbation object.
+
+    Returns:
+      masks: Positions where there are perturbations.
+      vertices: The resulting embeddings of the perturbed inputs.
+    """
     # The following are all shaped (after broadcasting) as:
     # (batch_size, num_perturbations, seq_length, embedding_size).
     embedding = self.embed_pad._embeddings  # pylint: disable=protected-access
@@ -386,8 +397,11 @@ class RobustModel(snt.AbstractModule):
     mask, vertices = self.compute_mask_vertices(data_batch, perturbation)
     return data_batch, mask, vertices
 
-  def add_dual_objective(self, minibatch, vocab_table,
-                         perturbation, stop_gradient=False):
+  def add_verifiable_objective(self,
+                               minibatch,
+                               vocab_table,
+                               perturbation,
+                               stop_gradient=False):
     # pylint: disable=g-missing-docstring
     data_batch = self.embed_dataset(minibatch, vocab_table)
     _, vertices = self.compute_mask_vertices(data_batch, perturbation)
@@ -407,10 +421,11 @@ class RobustModel(snt.AbstractModule):
         r=(self.delta if not stop_gradient else self.config['delta']))
     network.propagate_bounds(input_bounds)
 
-    # Calculate the dual objective.
-    dual_obj = dual_objective(network, data_batch.sentiment, margin=1.)
+    # Calculate the verifiable objective.
+    verifiable_obj = verifiable_objective(
+        network, data_batch.sentiment, margin=1.)
 
-    return dual_obj
+    return verifiable_obj
 
   def run_classification(self, inputs, labels, length):
     prediction = self.run_prediction(inputs, length)
@@ -418,32 +433,42 @@ class RobustModel(snt.AbstractModule):
                       dtype=tf.float32)
     return correct
 
-  def compute_dual_loss(self, dual_obj, labels):  # pylint: disable=g-missing-docstring
-    # three options: reduce max, reduce mean, and softmax.
+  def compute_verifiable_loss(self, verifiable_obj, labels):
+    """Compute verifiable training objective.
+
+    Args:
+      verifiable_obj: Verifiable training objective.
+      labels: Ground truth labels.
+    Returns:
+      verifiable_loss: Aggregrated loss of the verifiable training objective.
+    """
+    # Three options: reduce max, reduce mean, and softmax.
     if self.config['verifiable_training_aggregation'] == 'mean':
-      dual_loss = tf.reduce_mean(dual_obj)  # average across all target labels
+      verifiable_loss = tf.reduce_mean(
+          verifiable_obj)  # average across all target labels
     elif self.config['verifiable_training_aggregation'] == 'max':
-      # worst target label only
-      dual_loss = tf.reduce_mean(tf.reduce_max(dual_obj, axis=0))
+      # Worst target label only.
+      verifiable_loss = tf.reduce_mean(tf.reduce_max(verifiable_obj, axis=0))
     elif self.config['verifiable_training_aggregation'] == 'softmax':
-      # This assumes that entries in dual_obj belonging to the true class are
-      # set to a (large) negative value, so to not affect the softmax much.
+      # This assumes that entries in verifiable_obj belonging to the true class
+      # are set to a (large) negative value, so to not affect the softmax much.
 
       # [batch_size]. Compute x-entropy against one-hot distrib. for true label.
-      dual_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          logits=tf.transpose(dual_obj), labels=labels)
+      verifiable_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+          logits=tf.transpose(verifiable_obj), labels=labels)
 
-      dual_loss = tf.reduce_mean(dual_loss)  # aggregation across batch
+      verifiable_loss = tf.reduce_mean(
+          verifiable_loss)  # aggregation across batch
     else:
       logging.info(self.config['verifiable_training_aggregation'])
       raise ValueError(
           'Bad input argument for verifiable_training_aggregation used.')
 
-    return dual_loss
+    return verifiable_loss
 
-  def compute_dual_verified(self, dual_obj):
+  def compute_verifiable_verified(self, verifiable_obj):
     # Overall upper bound is maximum over all incorrect target classes.
-    bound = tf.reduce_max(dual_obj, axis=0)
+    bound = tf.reduce_max(verifiable_obj, axis=0)
     verified = tf.cast(bound <= 0, dtype=tf.float32)
     return bound, verified
 
@@ -533,8 +558,10 @@ class RobustModel(snt.AbstractModule):
     vocab_table = self.embed_pad.vocab_table
     vocab_size = self.embed_pad.vocab_size
 
-    dual_loss_ratio = tf.constant(self.config['dual_loss_ratio'],
-                                  dtype=tf.float32, name='dual_loss_ratio')
+    verifiable_loss_ratio = tf.constant(
+        self.config['verifiable_loss_ratio'],
+        dtype=tf.float32,
+        name='verifiable_loss_ratio')
     self.delta = tf.constant(self.config['delta'],
                              dtype=tf.float32, name='delta')
 
@@ -561,31 +588,32 @@ class RobustModel(snt.AbstractModule):
     train_words = self.vocab_list.lookup(train_data_batch.input_tokens)
 
     # [num_targets x batchsize]
-    dual_obj = self.add_dual_objective(train_minibatch, vocab_table,
-                                       train_perturbation,
-                                       stop_gradient=False)
+    verifiable_obj = self.add_verifiable_objective(
+        train_minibatch, vocab_table, train_perturbation, stop_gradient=False)
 
     train_nominal = self.run_classification(train_data_batch.embedded_inputs,
                                             train_data_batch.sentiment,
                                             train_data_batch.length)
-    train_bound, train_verified = self.compute_dual_verified(dual_obj)
-    dual_loss = self.compute_dual_loss(dual_obj, train_minibatch.sentiment)
+    train_bound, train_verified = self.compute_verifiable_verified(
+        verifiable_obj)
+    verifiable_loss = self.compute_verifiable_loss(verifiable_obj,
+                                                   train_minibatch.sentiment)
 
-    if (self.config['dual_loss_ratio']) > 1.0:
+    if (self.config['verifiable_loss_ratio']) > 1.0:
       raise ValueError('Loss ratios sum up to more than 1.0')
 
-    total_loss = (1 - dual_loss_ratio) * graph_tensors['loss']
-    if self.config['dual_loss_ratio'] != 0:
-      total_loss += dual_loss_ratio * dual_loss
+    total_loss = (1 - verifiable_loss_ratio) * graph_tensors['loss']
+    if self.config['verifiable_loss_ratio'] != 0:
+      total_loss += verifiable_loss_ratio * verifiable_loss
 
     # Attack on dev/test set.
     dev_perturbation = self.create_perturbation_ops(
         dev_minibatch, synonym_values, vocab_table)
     # [num_targets x batchsize]
-    dev_dual_obj = self.add_dual_objective(dev_minibatch, vocab_table,
-                                           dev_perturbation,
-                                           stop_gradient=True)
-    dev_bound, dev_verified = self.compute_dual_verified(dev_dual_obj)
+    dev_verifiable_obj = self.add_verifiable_objective(
+        dev_minibatch, vocab_table, dev_perturbation, stop_gradient=True)
+    dev_bound, dev_verified = self.compute_verifiable_verified(
+        dev_verifiable_obj)
 
     dev_data_batch, _, _ = self.preprocess_databatch(
         dev_minibatch, vocab_table, dev_perturbation)
@@ -593,10 +621,10 @@ class RobustModel(snt.AbstractModule):
     test_perturbation = self.create_perturbation_ops(
         test_minibatch, synonym_values, vocab_table)
     # [num_targets x batchsize]
-    test_dual_obj = self.add_dual_objective(test_minibatch, vocab_table,
-                                            test_perturbation,
-                                            stop_gradient=True)
-    test_bound, test_verified = self.compute_dual_verified(test_dual_obj)
+    test_verifiable_obj = self.add_verifiable_objective(
+        test_minibatch, vocab_table, test_perturbation, stop_gradient=True)
+    test_bound, test_verified = self.compute_verifiable_verified(
+        test_verifiable_obj)
 
     test_data_batch, _, _ = self.preprocess_databatch(
         test_minibatch, vocab_table, test_perturbation)
@@ -619,7 +647,7 @@ class RobustModel(snt.AbstractModule):
       opt_step = self._add_optimize_op(total_loss)
 
     graph_tensors['total_loss'] = total_loss
-    graph_tensors['dual_loss'] = dual_loss
+    graph_tensors['verifiable_loss'] = verifiable_loss
     graph_tensors['train_op'] = opt_step
     graph_tensors['indices'] = indices
     graph_tensors['lookup_token_index'] = lookup_token_index
@@ -628,7 +656,7 @@ class RobustModel(snt.AbstractModule):
     graph_tensors['vocab_size'] = vocab_size
     graph_tensors['synonym_values'] = synonym_values
     graph_tensors['synonym_counts'] = synonym_counts
-    graph_tensors['dual_loss_ratio'] = dual_loss_ratio
+    graph_tensors['verifiable_loss_ratio'] = verifiable_loss_ratio
     graph_tensors['delta'] = self.delta
 
     graph_tensors['train'] = {
@@ -670,19 +698,19 @@ class RobustModel(snt.AbstractModule):
       return f.read().splitlines()
 
 
-def dual_objective(network, labels, margin=0.):
-  """Computes the Lagrangian (dual objective).
+def verifiable_objective(network, labels, margin=0.):
+  """Computes the verifiable objective.
 
   Args:
     network: `ibp.VerifiableModelWrapper` for the network to verify.
     labels: 1D integer tensor of shape (batch_size) of labels for each
       input example.
-    margin: Dual objective values for correct class will be forced to
+    margin: Verifiable objective values for correct class will be forced to
       `-margin`, thus disregarding large negative bounds when maximising. By
       default this is set to 0.
 
   Returns:
-    2D tensor of shape (num_classes, batch_size) containing dual objective
+    2D tensor of shape (num_classes, batch_size) containing verifiable objective
       for each target class, for each example.
   """
   last_layer = network.output_module
@@ -695,23 +723,24 @@ def dual_objective(network, labels, margin=0.):
   per_neuron_objective = tf.maximum(
       obj_w * last_layer.input_bounds.lower_offset,
       obj_w * last_layer.input_bounds.upper_offset)
-  dual_obj = tf.reduce_sum(
+  verifiable_obj = tf.reduce_sum(
       per_neuron_objective,
       axis=list(range(2, per_neuron_objective.shape.ndims)))
 
   # Constant term (objective layer bias).
-  dual_obj += tf.reduce_sum(
+  verifiable_obj += tf.reduce_sum(
       obj_w * last_layer.input_bounds.nominal,
       axis=list(range(2, obj_w.shape.ndims)))
-  dual_obj += obj_b
+  verifiable_obj += obj_b
 
   # Filter out cases in which the target class is the correct class.
   # Using `margin` makes the irrelevant cases of target=correct return
   # a large negative value, which will be ignored by the reduce_max.
   num_classes = last_layer.output_bounds.shape[-1]
-  dual_obj = filter_correct_class(dual_obj, num_classes, labels, margin=margin)
+  verifiable_obj = filter_correct_class(
+      verifiable_obj, num_classes, labels, margin=margin)
 
-  return dual_obj
+  return verifiable_obj
 
 
 def targeted_objective(final_w, final_b, labels):
@@ -739,24 +768,25 @@ def targeted_objective(final_w, final_b, labels):
   return obj_w, obj_b
 
 
-def filter_correct_class(dual_obj, num_classes, labels, margin):
+def filter_correct_class(verifiable_obj, num_classes, labels, margin):
   """Filters out the objective when the target class contains the true label.
 
   Args:
-    dual_obj: 2D tensor of shape (num_classes, batch_size) containing
-      dual objectives.
+    verifiable_obj: 2D tensor of shape (num_classes, batch_size) containing
+      verifiable objectives.
     num_classes: number of target classes.
     labels: 1D tensor of shape (batch_size) containing the labels for each
       example in the batch.
-    margin: Dual objective values for correct class will be forced to
+    margin: Verifiable objective values for correct class will be forced to
       `-margin`, thus disregarding large negative bounds when maximising.
 
   Returns:
-   2D tensor of shape (num_classes, batch_size) containing the corrected dual
-   objective values for each (class, example).
+   2D tensor of shape (num_classes, batch_size) containing the corrected
+   verifiable objective values for each (class, example).
   """
   targets_to_filter = tf.expand_dims(
       tf.range(num_classes, dtype=labels.dtype), axis=1)
   neq = tf.not_equal(targets_to_filter, labels)
-  dual_obj = tf.where(neq, dual_obj, -margin * tf.ones_like(dual_obj))
-  return dual_obj
+  verifiable_obj = tf.where(neq, verifiable_obj, -margin *
+                            tf.ones_like(verifiable_obj))
+  return verifiable_obj

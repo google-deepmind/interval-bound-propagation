@@ -27,7 +27,7 @@ from interval_bound_propagation.src import bounds as bounds_lib
 from interval_bound_propagation.src import verifiable_wrapper
 import six
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 @six.add_metaclass(abc.ABCMeta)

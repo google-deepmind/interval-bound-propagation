@@ -23,7 +23,7 @@ import collections
 
 import interval_bound_propagation as ibp
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 MockLinearModule = collections.namedtuple('MockLinearModule', ['w', 'b'])

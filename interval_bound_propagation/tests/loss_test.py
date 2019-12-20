@@ -21,7 +21,7 @@ from __future__ import print_function
 
 import interval_bound_propagation as ibp
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class FixedNN(snt.AbstractModule):

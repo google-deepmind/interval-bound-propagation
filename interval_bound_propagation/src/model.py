@@ -26,7 +26,7 @@ from interval_bound_propagation.src import layers
 from interval_bound_propagation.src import verifiable_wrapper
 import numpy as np
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 # Set of supported activations. Must be monotonic and attributes of `tf.nn`.

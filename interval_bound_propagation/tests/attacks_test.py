@@ -23,7 +23,7 @@ from absl.testing import parameterized
 
 import interval_bound_propagation as ibp
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class MockWithIsTraining(object):

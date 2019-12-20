@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train sentence representation models on individual tasks."""
+"""Train verifiably robust models."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -25,36 +25,41 @@ import os
 from absl import app
 from absl import flags
 from absl import logging
-from interval_bound_propagation.examples.language import robust_model
+
 import numpy as np
 from six.moves import range
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+
+import robust_model
 
 
-if __name__ == '__main__':
-  flags.DEFINE_string('config_path', './config.py',
-                      'Path to training configuration file.')
-  flags.DEFINE_integer('batch_size', 30, 'Batch size.')
-  flags.DEFINE_integer('num_train_steps', 5000, 'Number of training steps.')
-  flags.DEFINE_integer('num_oov_buckets', 1, 'Number of out-of-vocab buckets.')
-  flags.DEFINE_integer('report_every', 100,
-                       'Report test loss every N batches.')
-  flags.DEFINE_float('schedule_ratio', 0.3, 'schedule_ratio * num_train_steps'
-                     '= the steps where reach the final delta/dual_loss.')
-  flags.DEFINE_float('learning_rate', 0.001, 'Learning rate.')
-  flags.DEFINE_float('max_grad_norm', 5.0, 'Maximum norm of gradients.')
-  flags.DEFINE_boolean('fine_tune_embeddings', True, 'Finetune embeddings.')
-  flags.DEFINE_string('task', 'sst', 'One of snli, mnli, sick, sst.')
-  flags.DEFINE_string('pooling', 'average', 'One of averge, sum, max, last.')
-  flags.DEFINE_boolean('evaluate', False, 'Evaluate mode.')
-  flags.DEFINE_boolean('analysis', False, 'Analysis mode.')
-  flags.DEFINE_string('analysis_split', 'test', 'Analysis dataset split.')
-  flags.DEFINE_string('experiment_root',
-                      '/tmp/robust_model/',
-                      'Path to save trained models.')
-  flags.DEFINE_string('tb_dir', None,
-                      'TB folder. If not specified, set under experiment_root')
-  FLAGS = flags.FLAGS
+flags.DEFINE_string('config_path', 'config.py',
+                    'Path to training configuration file.')
+flags.DEFINE_integer('batch_size', 40, 'Batch size.')
+flags.DEFINE_integer('num_train_steps', 150000, 'Number of training steps.')
+flags.DEFINE_integer('num_oov_buckets', 1,
+                     'Number of out of vocabulary buckets.')
+flags.DEFINE_integer('report_every', 100,
+                     'Report test loss every N batches.')
+flags.DEFINE_float('schedule_ratio', 0.8,
+                   'The final delta and verifiable_loss_ratio are reached when '
+                   'the number of steps equals schedule_ratio * '
+                   'num_train_steps.')
+flags.DEFINE_float('learning_rate', 0.001, 'Learning rate.')
+flags.DEFINE_float('max_grad_norm', 5.0, 'Maximum norm of gradients.')
+flags.DEFINE_boolean('fine_tune_embeddings', True, 'Finetune embeddings.')
+flags.DEFINE_string('task', 'sst', 'One of snli, mnli, sick, sst.')
+flags.DEFINE_string('pooling', 'average', 'One of averge, sum, max, last.')
+flags.DEFINE_boolean('evaluate', False, 'Evaluate mode.')
+flags.DEFINE_boolean('analysis', False, 'Analysis mode.')
+flags.DEFINE_string('analysis_split', 'test', 'Analysis dataset split.')
+flags.DEFINE_string('experiment_root',
+                    '/tmp/robust_model/',
+                    'Path to save trained models.')
+flags.DEFINE_string(
+    'tensorboard_dir', None,
+    'Tensorboard folder. If not specified, set under experiment_root')
+FLAGS = flags.FLAGS
 
 
 def load_synonyms(synonym_filepath=None):
@@ -96,30 +101,36 @@ def config_train_summary(task, train_accuracy, loss):
     loss: training loss.
 
   Returns:
-    train_summ: summary for training.
+    train_summary: summary for training.
     saver: tf.saver, used to save the checkpoint with the best dev accuracy.
   """
   train_acc_summ = tf.summary.scalar(('%s_train_accuracy' % task),
                                      train_accuracy)
   loss_summ = tf.summary.scalar('loss', loss)
-  train_summ = tf.summary.merge([train_acc_summ, loss_summ])
-  return train_summ
+  train_summary = tf.summary.merge([train_acc_summ, loss_summ])
+  return train_summary
+
+
+def write_tf_summary(writer, step, tag, value):
+  summary = tf.Summary()
+  summary.value.add(tag=tag, simple_value=value)
+  writer.add_summary(summary, step)
 
 
 def train(config_dict, synonym_filepath,
           batch_size, num_train_steps, schedule_ratio, report_every,
-          snapshot_path, tb_dir):
+          checkpoint_path, tensorboard_dir):
   """Model training."""
   graph_tensor_producer = robust_model.RobustModel(**config_dict)
   graph_tensors = graph_tensor_producer()
 
   synonym_keys, max_synoynm_counts, synonym_value_lens_cum, \
       synonym_values_list = construct_synonyms(synonym_filepath)
-  train_summ = config_train_summary(config_dict['task'],
-                                    graph_tensors['train_accuracy'],
-                                    graph_tensors['loss'])
+  train_summary = config_train_summary(config_dict['task'],
+                                       graph_tensors['train_accuracy'],
+                                       graph_tensors['loss'])
 
-  tf.gfile.MakeDirs(snapshot_path)
+  tf.gfile.MakeDirs(checkpoint_path)
 
   best_dev_accuracy = 0.0
   best_test_accuracy = 0.0
@@ -129,10 +140,10 @@ def train(config_dict, synonym_filepath,
   network_saver = tf.train.Saver(graph_tensor_producer.variables)
   with tf.train.SingularMonitoredSession() as session:
     logging.info('Initialize parameters...')
-    writer = tf.summary.FileWriter(tb_dir, session.graph)
+    writer = tf.summary.FileWriter(tensorboard_dir, session.graph)
     input_feed = {}
 
-    # Tokenize synonyms
+    # Tokenize synonyms.
     tokenize_synonyms = [[] for _ in range(graph_tensors['vocab_size'])]
     lookup_indices_keys = session.run(graph_tensors['indices'],
                                       feed_dict={graph_tensors['lookup_token']:
@@ -165,33 +176,35 @@ def train(config_dict, synonym_filepath,
             0., config['delta'])
         input_feed[graph_tensors['delta']] = delta
 
-      if config['dual_loss_ratio'] > 0.0 and config['dual_loss_schedule']:
+      if (config['verifiable_loss_ratio'] > 0.0 and
+          config['verifiable_loss_schedule']):
         if delta > 0.0 and warmup_steps == 0:
           warmup_steps = step
         if delta > 0.0:
-          dual_loss_ratio = linear_schedule(
+          verifiable_loss_ratio = linear_schedule(
               step, warmup_steps, schedule_ratio * num_train_steps,
-              0., config['dual_loss_ratio'])
+              0., config['verifiable_loss_ratio'])
         else:
-          dual_loss_ratio = 0.0
-        input_feed[graph_tensors['dual_loss_ratio']] = dual_loss_ratio
+          verifiable_loss_ratio = 0.0
+        input_feed[
+            graph_tensors['verifiable_loss_ratio']] = verifiable_loss_ratio
 
-      total_loss_np, loss_np, dual_loss_np, train_accuracy_np, \
+      total_loss_np, loss_np, verifiable_loss_np, train_accuracy_np, \
           train_bound, train_verified, \
-          dual_loss_ratio_val, delta_val, \
-          train_summ_py, _ = session.run(
+          verifiable_loss_ratio_val, delta_val, \
+          train_summary_py, _ = session.run(
               [graph_tensors['total_loss'],
                graph_tensors['loss'],
-               graph_tensors['dual_loss'],
+               graph_tensors['verifiable_loss'],
                graph_tensors['train_accuracy'],
                graph_tensors['train']['bound'],
                graph_tensors['train']['verified'],
-               graph_tensors['dual_loss_ratio'],
+               graph_tensors['verifiable_loss_ratio'],
                graph_tensors['delta'],
-               train_summ,
-               graph_tensors['train_op']], input_feed)  # pylint: disable=line-too-long
+               train_summary,
+               graph_tensors['train_op']], input_feed)
 
-      writer.add_summary(train_summ_py, step)
+      writer.add_summary(train_summary_py, step)
       if step % report_every == 0 or step == num_train_steps - 0:
         dev_total_num_correct = 0.0
         test_total_num_correct = 0.0
@@ -217,52 +230,31 @@ def train(config_dict, synonym_filepath,
         test_accuracy = test_total_num_correct / test_total_num_examples
         dev_verified_accuracy = dev_verified_count / dev_total_num_examples
         test_verified_accuracy = test_verified_count / test_total_num_examples
-        dev_summary = tf.Summary()
-        dev_summary.value.add(tag='dev_accuracy', simple_value=dev_accuracy)
-        test_summary = tf.Summary()
-        test_summary.value.add(tag='test_accuracy', simple_value=test_accuracy)
-        writer.add_summary(dev_summary, step)
-        writer.add_summary(test_summary, step)
 
-        train_bound_summary = tf.Summary()
-        train_bound_summary.value.add(tag='train_bound_summary',
-                                      simple_value=np.mean(train_bound))
-        writer.add_summary(train_bound_summary, step)
-        train_verified_summary = tf.Summary()
-        train_verified_summary.value.add(tag='train_verified_summary',
-                                         simple_value=np.mean(train_verified))
-        writer.add_summary(train_verified_summary, step)
+        write_tf_summary(writer, step, tag='dev_accuracy', value=dev_accuracy)
+        write_tf_summary(writer, step, tag='test_accuracy', value=test_accuracy)
+        write_tf_summary(writer, step, tag='train_bound_summary',
+                         value=np.mean(train_bound))
+        write_tf_summary(writer, step, tag='train_verified_summary',
+                         value=np.mean(train_verified))
+        write_tf_summary(writer, step, tag='dev_verified_summary',
+                         value=np.mean(dev_verified_accuracy))
+        write_tf_summary(writer, step, tag='test_verified_summary',
+                         value=np.mean(test_verified_accuracy))
+        write_tf_summary(writer, step, tag='total_loss_summary',
+                         value=total_loss_np)
+        write_tf_summary(writer, step, tag='verifiable_train_loss_summary',
+                         value=verifiable_loss_np)
 
-        dev_verified_summary = tf.Summary()
-        dev_verified_summary.value.add(tag='dev_verified_summary',
-                                       simple_value=
-                                       np.mean(dev_verified_accuracy))
-        writer.add_summary(dev_verified_summary, step)
-
-        test_verified_summary = tf.Summary()
-        test_verified_summary.value.add(tag='test_verified_summary',
-                                        simple_value=
-                                        np.mean(test_verified_accuracy))
-        writer.add_summary(test_verified_summary, step)
-
-        total_loss_summary = tf.Summary()
-        total_loss_summary.value.add(tag='total_loss_summary',
-                                     simple_value=total_loss_np)
-        writer.add_summary(total_loss_summary, step)
-        dual_train_loss_summary = tf.Summary()
-        dual_train_loss_summary.value.add(tag='dual_train_loss_summary',
-                                          simple_value=dual_loss_np)
-        writer.add_summary(dual_train_loss_summary, step)
-
-        logging.info('dual_loss_ratio: %f, delta: %f',
-                     dual_loss_ratio_val, delta_val)
+        logging.info('verifiable_loss_ratio: %f, delta: %f',
+                     verifiable_loss_ratio_val, delta_val)
         logging.info('step: %d, '
                      'train loss: %f, '
-                     'dual train loss: %f, '
+                     'verifiable train loss: %f, '
                      'train accuracy: %f, '
                      'dev accuracy: %f, '
                      'test accuracy: %f, ', step, loss_np,
-                     dual_loss_np, train_accuracy_np,
+                     verifiable_loss_np, train_accuracy_np,
                      dev_accuracy, test_accuracy)
         dev_verified_accuracy_mean = np.mean(dev_verified_accuracy)
         test_verified_accuracy_mean = np.mean(test_verified_accuracy)
@@ -274,7 +266,7 @@ def train(config_dict, synonym_filepath,
         if dev_accuracy > best_dev_accuracy:
           # Store most accurate model so far.
           network_saver.save(session.raw_session(),
-                             os.path.join(snapshot_path, 'best'))
+                             os.path.join(checkpoint_path, 'best'))
           best_dev_accuracy = dev_accuracy
           best_test_accuracy = test_accuracy
         logging.info('best dev acc\t%f\tbest test acc\t%f',
@@ -282,17 +274,19 @@ def train(config_dict, synonym_filepath,
         if dev_verified_accuracy_mean > best_verified_dev_accuracy:
           # Store model with best verified accuracy so far.
           network_saver.save(session.raw_session(),
-                             os.path.join(snapshot_path, 'best_verified'))
+                             os.path.join(checkpoint_path, 'best_verified'))
           best_verified_dev_accuracy = dev_verified_accuracy_mean
           best_verified_test_accuracy = test_verified_accuracy_mean
         logging.info('best verified dev acc\t%f\tbest verified test acc\t%f',
                      best_verified_dev_accuracy, best_verified_test_accuracy)
 
+        network_saver.save(session.raw_session(),
+                           os.path.join(checkpoint_path, 'model'))
         writer.flush()
 
     # Store model at end of training.
     network_saver.save(session.raw_session(),
-                       os.path.join(snapshot_path, 'final'))
+                       os.path.join(checkpoint_path, 'final'))
 
 
 def evaluate(config_dict, model_location):
@@ -337,7 +331,7 @@ def analysis(config_dict, synonym_filepath,
   graph_tensor_producer = robust_model.RobustModel(**config_dict)
   # Use new batch size.
   graph_tensor_producer.batch_size = batch_size
-  # Overwrite the config originally in the saved snapshot.
+  # Overwrite the config originally in the saved checkpoint.
   logging.info('old delta %f, old num_perturbations: %d',
                graph_tensor_producer.config['delta'],
                graph_tensor_producer.config['num_perturbations'])
@@ -362,7 +356,7 @@ def analysis(config_dict, synonym_filepath,
       session.run(graph_tensors[datasplit]['sentiment'])
 
     input_feed = {}
-    # Tokenize synonyms
+    # Tokenize synonyms.
     tokenize_synonyms = [[] for _ in range(graph_tensors['vocab_size'])]
     lookup_indices_keys = session.run(graph_tensors['indices'],
                                       feed_dict={graph_tensors['lookup_token']:
@@ -396,27 +390,14 @@ def analysis(config_dict, synonym_filepath,
     total_correct, total_verified = 0.0, 0.0
     for ibatch in range(total_num_batches):
       results = session.run(graph_tensors[datasplit], input_feed)
-      logging.info('%s bound = %.05f,  verified: %.03f,'
-                   '  nominally correct: %.03f',
-                   datasplit, np.mean(results['bound']),
+      logging.info('batch: %d, %s bound = %.05f, verified: %.03f,'
+                   ' nominally correct: %.03f',
+                   ibatch, datasplit, np.mean(results['bound']),
                    np.mean(results['verified']),
                    np.mean(results['correct']))
       total_correct += sum(results['correct'])
       total_verified += sum(results['verified'])
-      for j in range(batch_size):
-        logging.info({
-            'datasplit': datasplit,
-            'nominal': results['correct'][j],
-            'verify': results['verified'][j],
-            'bound': results['bound'][j],
-            'i': ibatch * batch_size + j,
-            'delta': delta,
-            'num_perturbations': num_perturbations,
-            'model_location': model_location,
-            'words': results['words'][j],
-            'prediction': results['predictions'][j].tolist(),
-            'label': results['sentiment'][j],
-        })
+
     total_correct /= total_num_examples
     total_verified /= total_num_examples
     logging.info('%s final correct: %.03f, verified: %.03f',
@@ -452,7 +433,7 @@ def main(_):
 
   if FLAGS.analysis:
     logging.info('Analyze model location: %s', config['model_location'])
-    base_batch_offset = config['scenario_offset'] * config['scenario_size']
+    base_batch_offset = 0
     analysis(config_dict, config['synonym_filepath'], config['model_location'],
              FLAGS.batch_size, base_batch_offset,
              0, datasplit=FLAGS.analysis_split,
@@ -464,22 +445,21 @@ def main(_):
     evaluate(config_dict, config['model_location'])
 
   else:
-    snapshot_path = os.path.join(FLAGS.experiment_root, 'snapshot')
+    checkpoint_path = os.path.join(FLAGS.experiment_root, 'checkpoint')
 
-    if FLAGS.tb_dir is None:
-      tb_dir = os.path.join(FLAGS.experiment_root, 'tensorboard')
+    if FLAGS.tensorboard_dir is None:
+      tensorboard_dir = os.path.join(FLAGS.experiment_root, 'tensorboard')
     else:
-      tb_dir = FLAGS.tb_dir
+      tensorboard_dir = FLAGS.tensorboard_dir
 
     train(config_dict, config['synonym_filepath'],
           FLAGS.batch_size,
           num_train_steps=FLAGS.num_train_steps,
           schedule_ratio=FLAGS.schedule_ratio,
           report_every=FLAGS.report_every,
-          snapshot_path=snapshot_path,
-          tb_dir=tb_dir)
+          checkpoint_path=checkpoint_path,
+          tensorboard_dir=tensorboard_dir)
 
 
 if __name__ == '__main__':
-  logging.set_stderrthreshold('info')
   app.run(main)

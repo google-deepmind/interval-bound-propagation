@@ -22,7 +22,7 @@ from __future__ import print_function
 import interval_bound_propagation as ibp
 import numpy as np
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def _generate_identity_spec(modules, shape, dimension=1):

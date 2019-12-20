@@ -21,7 +21,7 @@ from __future__ import print_function
 
 from interval_bound_propagation.src import layers
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def conv_output_shape(input_shape, w, padding, strides):

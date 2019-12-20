@@ -15,7 +15,7 @@
 
 """Functionality for exhaustive adversarial attacks on synonym perturbations.
 
-Models restored from snapshots can be tested w.r.t their robustness to
+Models restored from checkpoint can be tested w.r.t their robustness to
 exhaustive-search adversaries, which have a fixed perturbation budget with which
 they can flip words to synonyms.
 """
@@ -33,18 +33,18 @@ import pprint
 from absl import app
 from absl import flags
 from absl import logging
-from interval_bound_propagation.examples.language import interactive_example
 import numpy as np
-from six.moves import range
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 import tqdm
+
+import interactive_example
 
 
 flags.DEFINE_boolean('character_level', True, 'Character level model.')
 flags.DEFINE_boolean('debug_mode', False, 'Debug mode.')
-flags.DEFINE_string('snapshot_path', '/tmp/ibp_nlp/best_verified',
-                    'Snapshot path.')
+flags.DEFINE_string('checkpoint_path', '/tmp/ibp_nlp/best_verified',
+                    'Checkpoint path.')
 flags.DEFINE_string('dataset', 'sst', 'Dataset name. train, dev, or test.')
 flags.DEFINE_string('mode', 'validation', 'Dataset part. train, dev, or test.')
 flags.DEFINE_string('config_path', './config.py',
@@ -147,16 +147,16 @@ def find_up_to_depth_k_perturbations(
   Returns:
     output_sentences: List[List[str]]. List of tokenised sentences.
   """
-  # case: recursion ends - no further perturbations.
+  # Case: recursion ends - no further perturbations.
   if k == 0:
     return [tokenized_sentence]
   else:
-    # expand by one level
+    # Expand by one level.
     expanded_sentences = expand_by_one_perturbation(original_tokenized_sentence,
                                                     tokenized_sentence,
                                                     synonym_dict)
 
-    # call recursive function one level deeper for each expanded sentence
+    # Call recursive function one level deeper for each expanded sentence.
     expanded_sentences_deeper = []
     for sentence in expanded_sentences:
       new_sentences = find_up_to_depth_k_perturbations(
@@ -169,10 +169,10 @@ def find_up_to_depth_k_perturbations(
 
 
 def remove_duplicates(list_of_list_of_tokens):
-  # convert list of str to str
+  # Convert list of str to str.
   sentences = ['|'.join(s) for s in list_of_list_of_tokens]
-  sentences = set(sentences)  # now hashable -> remove duplicates
-  sentences = [s.split('|') for s in sentences]  # convert to original format
+  sentences = set(sentences)  # Now hashable -> remove duplicates.
+  sentences = [s.split('|') for s in sentences]  # Convert to original format.
   return sentences
 
 
@@ -195,27 +195,27 @@ def verify_exhaustively(sample, synonym_dict, sst_model, delta,
   (x, y) = sample
   counter_example = None
   counter_prediction = None
-  # create (potentially long) list of perturbed sentences from x.
+  # Create (potentially long) list of perturbed sentences from x.
   if truncated_len > 0:
     x = x[: truncated_len]
-  # add original sentence
+  # Add original sentence.
   altered_sentences = find_up_to_depth_k_perturbations(x, x, synonym_dict,
                                                        delta)
   altered_sentences = altered_sentences + [x]
-  # form batches of these altered sentences
+  # Form batches of these altered sentences.
   batch = []
   num_forward_passes = len(altered_sentences)
 
   for sentence in altered_sentences:
     any_prediction_wrong = False
     batch.append(sentence)
-    # when batch_size is reached, make predictions, break if any label flip
+    # When batch_size is reached, make predictions, break if any label flip
     if len(batch) == sst_model.batch_size:
       # np array of size [batch_size]
       predictions, _ = sst_model.batch_predict_sentiment(
           batch, is_tokenised=True)
 
-      # any prediction that is different from the true label?
+      # Check any prediction that is different from the true label.
       any_prediction_wrong = np.any(predictions != y)
       if any_prediction_wrong:
         wrong_index = np.where(predictions != y)[0].tolist()[0]
@@ -226,18 +226,18 @@ def verify_exhaustively(sample, synonym_dict, sst_model, delta,
           logging.info('\ncounter example:  %s, prediction: %s',
                        counter_example, predictions[wrong_index].tolist())
         counter_prediction = predictions[wrong_index]
-        # break. No need to evaluate further.
+        # Break. No need to evaluate further.
         return False, counter_example, counter_prediction, num_forward_passes
 
-      # start filling up the next batch.
+      # Start filling up the next batch.
       batch = []
 
   if not batch:
-    # no remainder, not previously broken the loop
+    # No remainder, not previously broken the loop.
     return True, None, None, num_forward_passes
   else:
-    # remainder -- what didn't fit into a full batch of size batch_size
-    # we use the first altered_sentence to pad.
+    # Remainder -- what didn't fit into a full batch of size batch_size.
+    # We use the first altered_sentence to pad.
     batch += [altered_sentences[0]]*(sst_model.batch_size-len(batch))
     assert len(batch) == sst_model.batch_size
     predictions, _ = sst_model.batch_predict_sentiment(batch, is_tokenised=True)
@@ -261,7 +261,7 @@ def verify_dataset(dataset, config_dict, model_location, synonym_dict, delta):
       config_dict, model_location,
       max_padded_length=FLAGS.max_padded_length,
       num_perturbations=FLAGS.num_perturbations)
-  verified_list = []  # holds boolean entries, across dataset
+  verified_list = []  # Holds boolean entries, across dataset.
   samples = []
   labels = []
   counter_examples = []
@@ -306,15 +306,15 @@ def example(synonym_dict, dataset, k=2):
   # 'refrigerated' --> ['cooled', 'chilled']
   x = ['the', 'refrigerated', 'decree', 'tubes']
 
-  # example: 1 perturbation
+  # Example: 1 perturbation.
   new_x = expand_by_one_perturbation(x, x, synonym_dict)
   pprint.pprint(sorted(new_x))
 
-  # example: up to k perturbations
+  # Example: up to k perturbations.
   new_x = find_up_to_depth_k_perturbations(x, x, synonym_dict, k)
   pprint.pprint(sorted(new_x))
 
-  # statistics: how large is the combinatorial space of perturbations?
+  # Statistics: how large is the combinatorial space of perturbations?
   total_x = []
   size_counter = collections.Counter()
   for (x, _) in tqdm.tqdm(dataset):
@@ -322,10 +322,10 @@ def example(synonym_dict, dataset, k=2):
     size_counter[len(new_x)] += 1
     total_x.extend(new_x)
 
-  # histogram for perturbation space size, computed across dataset
+  # Histogram for perturbation space size, computed across dataset.
   pprint.pprint([x for x in sorted(size_counter.items(), key=lambda xx: xx[0])])
 
-  # total number of inputs for forward pass if comprehensively evaluated
+  # Total number of inputs for forward pass if comprehensively evaluated.
   pprint.pprint(len(total_x))
 
 
@@ -349,63 +349,32 @@ def main(args):
                  'num_oov_buckets': FLAGS.num_oov_buckets,
                  'max_grad_norm': 0.}
 
-  # maximum verification range
+  # Maximum verification range.
   delta = FLAGS.delta
   character_level = FLAGS.character_level
   mode = FLAGS.mode
-  model_location = FLAGS.snapshot_path
+  model_location = FLAGS.checkpoint_path
 
-  # load synonyms
+  # Load synonyms.
   synonym_filepath = config['synonym_filepath']
   synonym_dict = load_synonyms(synonym_filepath)
 
-  # load data
+  # Load data.
   dataset = load_dataset(mode, character_level)
 
-  # compute verifiable accuracy on dataset
-  (verified_proportion, verified_list, samples, counter_examples,
-   counter_predictions,
-   total_num_forward_passes) = verify_dataset(dataset, config_dict,
-                                              model_location,
-                                              synonym_dict, delta)
+  # Compute verifiable accuracy on dataset.
+  (verified_proportion, _, _, _, _, _) = verify_dataset(dataset, config_dict,
+                                                        model_location,
+                                                        synonym_dict, delta)
   logging.info('verified_proportion:')
   logging.info(str(verified_proportion))
   logging.info({
       'delta': FLAGS.delta,
       'character_level': FLAGS.character_level,
       'mode': FLAGS.mode,
-      'snapshot_path': FLAGS.snapshot_path,
+      'checkpoint_path': FLAGS.checkpoint_path,
       'verified_proportion': verified_proportion
   })
-  if FLAGS.debug_mode:
-    for i in range(len(verified_list)):
-      logging.info({
-          'delta': FLAGS.delta,
-          'character_level': FLAGS.character_level,
-          'mode': FLAGS.mode,
-          'snapshot_path': FLAGS.snapshot_path,
-          'verified_proportion': verified_list[i],
-          'index': FLAGS.skip_batches + i,
-          'sample': samples[i],
-          'counter_example': counter_examples[i],
-          'counter_prediction': counter_predictions[i],
-          'label': dataset[i][1],
-          'skip_batches': FLAGS.skip_batches,
-          'num_examples': FLAGS.num_examples,
-          'num_forward_passes': total_num_forward_passes[i],
-      })
-  else:
-    for i in range(len(verified_list)):
-      logging.info({
-          'delta': FLAGS.delta,
-          'character_level': FLAGS.character_level,
-          'mode': FLAGS.mode,
-          'snapshot_path': FLAGS.snapshot_path,
-          'verified_proportion': verified_list[i],
-          'index': FLAGS.skip_batches + i,
-          'skip_batches': FLAGS.skip_batches,
-          'num_examples': FLAGS.num_examples,
-      })
 
 
 if __name__ == '__main__':

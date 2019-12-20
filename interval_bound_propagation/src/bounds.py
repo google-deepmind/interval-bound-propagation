@@ -24,7 +24,7 @@ import itertools
 
 import six
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 @six.add_metaclass(abc.ABCMeta)

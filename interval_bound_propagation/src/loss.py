@@ -22,7 +22,7 @@ from __future__ import print_function
 import collections
 
 import sonnet as snt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 # Used to pick the least violated specification.
 _BIG_NUMBER = 1e25
